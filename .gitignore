@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+.env
+*.log
+
+# local runtime workspace data
+/workspace/
+/workspace-*/
+
+# editor artifacts
+/.trae-html-share-packages/
