@@ -64,7 +64,7 @@ function makeFieldRow(node, path, ctx, options = {}) {
   head.innerHTML = `
     ${options.indexLabel ? `<span class="type-tag">${escapeHtml(options.indexLabel)}</span>` : ""}
     <span class="field-label">${escapeHtml(node.label || "item")}</span>
-    ${node.required ? '<span class="req">*</span>' : ""}
+    ${node.required ? '<span class="req" title="Required">*</span>' : ""}
     <span class="type-tag">${TYPE_LABELS[node.type] || node.type}</span>
     ${options.extraHead || ""}
     <button type="button" class="note-btn${note ? " has-note" : ""}" title="Field note" aria-label="Field note"><i class="bi bi-sticky"></i></button>
@@ -93,6 +93,7 @@ function makeFieldRow(node, path, ctx, options = {}) {
   const noteInput = document.createElement("textarea");
   noteInput.className = "note-input";
   noteInput.placeholder = "Field note (included in notes export and prompt material)";
+  noteInput.setAttribute("aria-label", `Field note for ${node.label || "item"}`);
   noteInput.value = note;
   row.appendChild(noteInput);
 
@@ -249,6 +250,7 @@ function buildScalar(node, path, value, setValue, ctx) {
       if (msg) msg.textContent = problem || "";
     }
     input.classList.toggle("invalid", Boolean(problem));
+    input.setAttribute("aria-invalid", String(Boolean(problem)));
   };
 
   input.addEventListener("input", () => {
@@ -293,10 +295,16 @@ function displayValue(value) {
 
 export function applyDiff(container, fields, onRevert) {
   const map = container._fieldMap || new Map();
-  for (const info of map.values()) info.diffEl.innerHTML = "";
+  for (const info of map.values()) {
+    info.diffEl.innerHTML = "";
+    if (info.row) {
+      info.row.classList.remove("diff-added", "diff-modified", "diff-removed");
+    }
+  }
   for (const field of fields || []) {
     const info = map.get(field.path);
     if (!info) continue;
+    if (info.row) info.row.classList.add(`diff-${field.kind}`);
     const line = document.createElement("div");
     line.className = `diff-line ${field.kind}`;
     const kind = document.createElement("span");

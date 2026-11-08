@@ -77,7 +77,7 @@ async function renderProjects() {
   try {
     const data = await api.get("/api/projects");
     state.projects = data.projects;
-    topCenter.innerHTML = `<span class="workspace-path" title="${escapeHtml(data.workspace)}"><i class="bi bi-hdd-network"></i>Workspace: ${escapeHtml(data.workspace)}</span>`;
+    topCenter.innerHTML = `<span class="workspace-path" title="${escapeHtml(data.workspace)}"><i class="bi bi-hdd-network"></i><span>Workspace: ${escapeHtml(data.workspace)}</span></span>`;
     const cards = data.projects
       .map(
         (project) => `
@@ -150,7 +150,7 @@ function renderError(title, error) {
         <a class="btn" href="#/"><i class="bi bi-arrow-left"></i> Back to projects</a>
       </div>
       ${conflictHtml}
-      <div class="empty-hint">Fix the image folder or file names, then click Rescan.</div>
+      <div class="empty-hint"><i class="bi bi-exclamation-triangle" aria-hidden="true"></i><div>Fix the image folder or file names, then click Rescan.</div></div>
     </div>
   `;
   topCenter.innerHTML = "";
@@ -231,10 +231,10 @@ function renderShell() {
 
   topCenter.innerHTML = `
     <span class="switch-icon" title="Current project"><i class="bi bi-collection"></i></span>
-    <select id="project-switch" title="Switch project">
+    <select id="project-switch" title="Switch project" aria-label="Switch project">
       ${switchOptions}
     </select>
-    <span class="workspace-path" title="${escapeHtml(state.project.images_dir)}"><i class="bi bi-folder2-open"></i>Images: ${escapeHtml(state.project.images_dir)}</span>
+    <span class="workspace-path" title="${escapeHtml(state.project.images_dir)}"><i class="bi bi-folder2-open"></i><span>Images: ${escapeHtml(state.project.images_dir)}</span></span>
   `;
   topActions.innerHTML = `
     <button class="btn small" id="btn-schema" title="Edit schema"><i class="bi bi-diagram-3"></i><span class="btn-label">Schema</span></button>
@@ -254,7 +254,7 @@ function renderShell() {
             <span class="flex-grow-1"></span>
             <button class="btn small ghost" id="btn-select-visible" title="Select all visible cases"><i class="bi bi-check2-square"></i><span class="btn-label">Select all</span></button>
           </div>
-          <div class="filter-row" id="filter-row"></div>
+          <div class="filter-row" id="filter-row" role="group" aria-label="Filter cases"></div>
           <div class="list-scroll" id="case-list"></div>
         </aside>
         <aside class="pane pane-center">
@@ -263,6 +263,14 @@ function renderShell() {
             <span id="case-warning"></span>
           </div>
           <div class="viewer-stage" id="viewer-stage">
+            <div class="stage-placeholder" id="stage-placeholder">
+              <i class="bi bi-images" aria-hidden="true"></i>
+              <span class="stage-text">Select a case to preview</span>
+            </div>
+            <div class="stage-loading" id="stage-loading" role="status" aria-live="polite" hidden>
+              <span class="spinner" aria-hidden="true"></span>
+              <span>Loading image…</span>
+            </div>
             <img id="viewer-img" alt="Case image" />
           </div>
           <div class="viewer-toolbar">
@@ -279,12 +287,12 @@ function renderShell() {
         </aside>
         <aside class="pane pane-right">
           <div class="form-toolbar">
-            <select id="status-select" title="Annotation status">
+            <select id="status-select" title="Annotation status" aria-label="Annotation status">
               <option value="draft">Draft</option>
               <option value="done">Done</option>
             </select>
-            <input id="tags-input" placeholder="Tags, comma separated" style="flex:1;min-width:120px" />
-            <span class="save-state" id="save-state">Not loaded</span>
+            <input id="tags-input" placeholder="Tags, comma separated" aria-label="Tags" style="flex:1;min-width:120px" />
+            <span class="save-state" id="save-state" role="status" aria-live="polite">Not loaded</span>
           </div>
           <div class="form-scroll" id="form-scroll"></div>
         </aside>
@@ -335,6 +343,9 @@ function renderShell() {
   const image = document.getElementById("viewer-img");
   const scaleLabel = document.getElementById("scale-label");
   viewer = createViewer({ stage, img: image, scaleLabel });
+  image.addEventListener("load", () => setStageState("image"));
+  image.addEventListener("error", () => setStageState("error"));
+  setStageState("empty");
 
   document.getElementById("btn-fit").addEventListener("click", () => viewer.fit());
   document.getElementById("btn-reset").addEventListener("click", () => viewer.reset());
@@ -375,7 +386,7 @@ function renderCaseList() {
 
   filterRow.innerHTML = FILTERS.map(
     (filter) =>
-      `<button type="button" class="chip${state.filter === filter.key ? " active" : ""}" data-filter="${filter.key}">${filter.label}</button>`
+      `<button type="button" class="chip${state.filter === filter.key ? " active" : ""}" data-filter="${filter.key}" aria-pressed="${state.filter === filter.key}">${filter.label}</button>`
   ).join("");
   filterRow.querySelectorAll("[data-filter]").forEach((chip) => {
     chip.addEventListener("click", () => {
@@ -406,11 +417,21 @@ function renderCaseList() {
     })
     .join("");
 
-  list.innerHTML = html || '<div class="muted" style="padding:12px 6px">No matching cases</div>';
+  const emptyState = state.cases.length
+    ? '<div class="empty-state list-empty"><i class="bi bi-funnel" aria-hidden="true"></i><p>No cases match this filter.</p></div>'
+    : '<div class="empty-state list-empty"><i class="bi bi-images" aria-hidden="true"></i><p>No images in this project.</p></div>';
+
+  list.innerHTML = html || emptyState;
 }
 
 function caseRowHtml(item) {
   const annotation = item.annotation;
+  const source = String(item.source || "");
+  const normalized = source.replace(/\\/g, "/");
+  const slash = normalized.lastIndexOf("/");
+  const fileName = slash >= 0 ? normalized.slice(slash + 1) : normalized;
+  const dirPath = slash > 0 ? normalized.slice(0, slash + 1) : "";
+  const displayName = fileName || item.case_id;
   const dotClass =
     annotation && annotation.status === "done"
       ? "dot done"
@@ -437,7 +458,10 @@ function caseRowHtml(item) {
   return `<div class="case-item list-group-item${item.case_id === state.currentId ? " active" : ""}" data-case="${escapeHtml(item.case_id)}">
     <input type="checkbox" data-check="${escapeHtml(item.case_id)}" ${state.selected.has(item.case_id) ? "checked" : ""} aria-label="Select case" />
     <span class="${dotClass}" title="${dotTitle}"></span>
-    <span class="case-name" title="${escapeHtml(item.source)}">${escapeHtml(item.case_id)}</span>
+    <span class="case-name" title="${escapeHtml(item.source || item.case_id)}">
+      <span class="case-file">${escapeHtml(displayName)}</span>
+      ${dirPath ? `<span class="case-dir">${escapeHtml(dirPath)}</span>` : ""}
+    </span>
     ${badges.join("")}
   </div>`;
 }
@@ -503,9 +527,13 @@ function renderCase() {
     return;
   }
   if (viewer) {
-    viewer.load(
-      projectUrl(state.projectId, `/preview/${encodeURIComponent(item.case_id)}?w=2000`)
+    const imageUrl = projectUrl(
+      state.projectId,
+      `/preview/${encodeURIComponent(item.case_id)}?w=2000`
     );
+    const image = document.getElementById("viewer-img");
+    if (!image || image.getAttribute("src") !== imageUrl) setStageState("loading");
+    viewer.load(imageUrl);
   }
   const sourceNode = document.getElementById("case-source");
   sourceNode.innerHTML = `<i class="bi bi-file-earmark-image"></i><span>${escapeHtml(item.source)}</span>`;
@@ -547,8 +575,28 @@ function renderRaw() {
   }
 }
 
+function setStageState(kind) {
+  const stage = document.getElementById("viewer-stage");
+  const loading = document.getElementById("stage-loading");
+  const placeholder = document.getElementById("stage-placeholder");
+  if (stage) stage.classList.toggle("image-error", kind === "error");
+  if (loading) loading.hidden = kind !== "loading";
+  if (!placeholder) return;
+  placeholder.hidden = kind === "image" || kind === "loading";
+  const icon = placeholder.querySelector(".bi");
+  const text = placeholder.querySelector(".stage-text");
+  if (kind === "error") {
+    if (icon) icon.className = "bi bi-exclamation-triangle";
+    if (text) text.textContent = "Image failed to load";
+  } else {
+    if (icon) icon.className = "bi bi-images";
+    if (text) text.textContent = "Select a case to preview";
+  }
+}
+
 function renderEmptyCase(message) {
   if (viewer) viewer.clear();
+  setStageState("empty");
   const source = document.getElementById("case-source");
   if (source) {
     source.textContent = "";
@@ -560,7 +608,9 @@ function renderEmptyCase(message) {
     warning.className = "";
   }
   const form = document.getElementById("form-scroll");
-  if (form) form.innerHTML = `<div class="muted" style="padding:12px 0">${escapeHtml(message)}</div>`;
+  if (form) {
+    form.innerHTML = `<div class="empty-state"><i class="bi bi-card-image" aria-hidden="true"></i><p>${escapeHtml(message)}</p></div>`;
+  }
   const raw = document.getElementById("raw-json");
   if (raw) raw.textContent = "";
   state.annotation = null;
