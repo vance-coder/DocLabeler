@@ -5,7 +5,7 @@ export function openModal({ title, wide = false, onClose }) {
   const backdrop = document.createElement("div");
   backdrop.className = "modal-backdrop";
   backdrop.innerHTML = `
-    <div class="modal${wide ? " wide" : ""}" role="dialog" aria-modal="true">
+    <div class="modal${wide ? " wide" : ""}" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}">
       <div class="modal-head">
         <h2>${escapeHtml(title)}</h2>
         <button type="button" class="btn-close close" aria-label="Close"></button>

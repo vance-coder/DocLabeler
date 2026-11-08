@@ -41,7 +41,7 @@ python app.py --workspace D:\data\doclabeler
       .baseline/<import_id>/   # 导入快照（不可变），含 cases/*.json、meta.json、report.json
       imports/index.json
       imports/reports/<import_id>.json
-      collections/          # 预留：手动合集
+      collections/          # 手动合集
       exports/<version>/
       .cache/preview/       # 预览 PNG 缓存
 ```
@@ -193,12 +193,13 @@ python -m pytest tests -q
 ```
 
 覆盖：case_id 生成与冲突、case_id 片段匹配与歧义取首张、CSV 长表导入与类型校验、
-导出 manifest 完整性、label 改名后的标注迁移、API 主流程与乐观锁。
+导出 manifest 完整性、label 改名后的标注迁移、API 主流程与乐观锁、批量操作、
+revert all、合集 CRUD、备注聚合与冲突判定、prompt 草稿。
 
 ## 当前范围
 
 已实现：多项目、扫描、schema 三种来源与版本快照、标注与自动保存、导入与 baseline、
-差异高亮与单字段回退、导出（JSON / 宽表 CSV / manifest）。
-
-尚未实现（数据结构与目录已预留）：手动合集与展示模式、备注聚合与 prompt 草稿、
-字段级 undo/redo。
+差异高亮与单字段/整体回退、导出（JSON / 宽表 CSV / manifest）、批量状态与标签、
+手动合集与展示模式、备注聚合（冲突标记）与 prompt 草稿、字段级 undo/redo。
+界面提供进度与下一张未标注、搜索与过滤计数、缩略图条、分栏拖拽、快捷键帮助、
+全局保存状态与冲突处理。

@@ -316,3 +316,67 @@ export function openExportModal({
   modal.foot.appendChild(cancel);
   modal.foot.appendChild(submit);
 }
+
+// ---------------------------------------------------------------------------
+// Collection name
+// ---------------------------------------------------------------------------
+export function openCollectionNameModal({
+  title = "New collection",
+  submitLabel = "Create collection",
+  onConfirm,
+}) {
+  const modal = openModal({ title });
+
+  const name = textInput("e.g. Invoice batch 1");
+  const message = mk("div", "schema-msg");
+  modal.body.appendChild(
+    fieldRow(
+      "Collection name",
+      name,
+      "Short and readable. Slashes and “..” are not allowed."
+    )
+  );
+  modal.body.appendChild(message);
+
+  const cancel = mk("button", "btn");
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => modal.close());
+
+  const submit = mk("button", "btn primary");
+  submit.textContent = submitLabel;
+
+  const confirm = async () => {
+    const value = name.value.trim();
+    message.textContent = "";
+    if (!value) {
+      message.textContent = "Enter a collection name.";
+      name.focus();
+      return;
+    }
+    if (/[\\/]|\.\./.test(value)) {
+      message.textContent = "Name cannot contain /, \\ or ..";
+      name.focus();
+      return;
+    }
+    submit.disabled = true;
+    try {
+      await onConfirm(value);
+      modal.close();
+    } catch (error) {
+      message.textContent = error.message;
+    } finally {
+      submit.disabled = false;
+    }
+  };
+
+  submit.addEventListener("click", confirm);
+  name.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    confirm();
+  });
+
+  modal.foot.appendChild(cancel);
+  modal.foot.appendChild(submit);
+  name.focus();
+}

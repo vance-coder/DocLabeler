@@ -10,7 +10,103 @@ const TYPE_LABELS = {
 
 const KIND_LABELS = { added: "Added", modified: "Modified", removed: "Removed" };
 
+// ---------------------------------------------------------------------------
+// Field note popover (single instance, appended to body to avoid clipping)
+// ---------------------------------------------------------------------------
+let activeNotePopover = null;
+
+function closeNotePopover() {
+  if (!activeNotePopover) return;
+  const { el, cleanup } = activeNotePopover;
+  activeNotePopover = null;
+  cleanup();
+  el.remove();
+}
+
+function openNotePopover(anchor, { path, value, label, onChange }) {
+  if (activeNotePopover && activeNotePopover.anchor === anchor) {
+    closeNotePopover();
+    return;
+  }
+  closeNotePopover();
+
+  const el = document.createElement("div");
+  el.className = "note-popover";
+  el.setAttribute("role", "dialog");
+  el.setAttribute("aria-label", `Field note for ${label}`);
+
+  const input = document.createElement("textarea");
+  input.className = "note-input";
+  input.placeholder = "Add a note for this field…";
+  input.setAttribute("aria-label", `Field note for ${label}`);
+  input.value = value;
+
+  const hint = document.createElement("div");
+  hint.className = "note-popover-hint";
+  hint.textContent = "Saved with the annotation.";
+
+  el.appendChild(input);
+  el.appendChild(hint);
+  document.body.appendChild(el);
+
+  const ring = anchor.getBoundingClientRect();
+  const width = 260;
+  const gap = 8;
+  const left = Math.min(
+    Math.max(gap, ring.right - width),
+    Math.max(gap, window.innerWidth - width - gap)
+  );
+  let top = ring.bottom + 6;
+  if (top + el.offsetHeight > window.innerHeight - gap) {
+    top = Math.max(gap, ring.top - el.offsetHeight - 6);
+  }
+  el.style.left = `${left}px`;
+  el.style.top = `${top}px`;
+
+  input.addEventListener("input", () => onChange(input.value));
+
+  const onKey = (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopPropagation();
+    closeNotePopover();
+    anchor.focus();
+  };
+  const onPointer = (event) => {
+    if (el.contains(event.target) || anchor.contains(event.target)) return;
+    closeNotePopover();
+  };
+  const onScroll = (event) => {
+    if (el.contains(event.target)) return;
+    closeNotePopover();
+  };
+  const onResize = () => closeNotePopover();
+  const timer = setTimeout(() => {
+    document.addEventListener("pointerdown", onPointer, true);
+    document.addEventListener("scroll", onScroll, true);
+  }, 0);
+  document.addEventListener("keydown", onKey, true);
+  window.addEventListener("resize", onResize);
+
+  activeNotePopover = {
+    el,
+    anchor,
+    path,
+    cleanup: () => {
+      clearTimeout(timer);
+      document.removeEventListener("keydown", onKey, true);
+      document.removeEventListener("pointerdown", onPointer, true);
+      document.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", onResize);
+    },
+  };
+
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
 export function renderForm(container, ctx) {
+  closeNotePopover();
   container.innerHTML = "";
   const fieldEls = new Map();
   container._fieldMap = fieldEls;
@@ -22,10 +118,38 @@ export function renderForm(container, ctx) {
   };
   if (!local.schema || !(local.schema.children || []).length) {
     container.innerHTML = '<div class="muted" style="padding:12px 0">The schema has no fields yet. Click “Schema” in the top bar to add fields.</div>';
+    if (typeof local.onRender === "function") local.onRender(container);
     return;
   }
   renderChildren(container, local.schema, local.values || {}, local, "");
   applyDiff(container, local.diffFields || [], local.onRevert);
+  if (typeof local.onRender === "function") local.onRender(container);
+}
+
+function cloneValues(value) {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (error) {
+    return value;
+  }
+}
+
+function normalizeScalar(node, value) {
+  if (node.type === "boolean") {
+    return value === true ? true : value === false ? false : "";
+  }
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function applyStructureChange(ctx, mutate, label) {
+  const before = cloneValues(ctx.values);
+  mutate();
+  const after = cloneValues(ctx.values);
+  ctx.rerender();
+  ctx.onChange();
+  if (typeof ctx.onStructureChange === "function") {
+    ctx.onStructureChange({ before, after, label });
+  }
 }
 
 function defaultFor(node) {
@@ -67,7 +191,7 @@ function makeFieldRow(node, path, ctx, options = {}) {
     ${node.required ? '<span class="req" title="Required">*</span>' : ""}
     <span class="type-tag">${TYPE_LABELS[node.type] || node.type}</span>
     ${options.extraHead || ""}
-    <button type="button" class="note-btn${note ? " has-note" : ""}" title="Field note" aria-label="Field note"><i class="bi bi-sticky"></i></button>
+    <button type="button" class="note-btn${String(note).trim() ? " has-note" : ""}" title="${String(note).trim() ? "Edit field note" : "Field note"}" aria-label="Field note for ${escapeHtml(node.label || "item")}" aria-haspopup="dialog"><i class="bi bi-sticky" aria-hidden="true"></i></button>
   `;
   if (options.removable) {
     const remove = document.createElement("button");
@@ -78,6 +202,10 @@ function makeFieldRow(node, path, ctx, options = {}) {
   }
   row.appendChild(head);
 
+  const diff = document.createElement("div");
+  diff.className = "field-diff";
+  row.appendChild(diff);
+
   const control = document.createElement("div");
   control.className = "field-control";
   row.appendChild(control);
@@ -86,28 +214,20 @@ function makeFieldRow(node, path, ctx, options = {}) {
   msg.className = "field-msg";
   row.appendChild(msg);
 
-  const diff = document.createElement("div");
-  diff.className = "field-diff";
-  row.appendChild(diff);
-
-  const noteInput = document.createElement("textarea");
-  noteInput.className = "note-input";
-  noteInput.placeholder = "Field note (included in notes export and prompt material)";
-  noteInput.setAttribute("aria-label", `Field note for ${node.label || "item"}`);
-  noteInput.value = note;
-  row.appendChild(noteInput);
-
   const noteBtn = head.querySelector(".note-btn");
   noteBtn.addEventListener("click", () => {
-    row.classList.toggle("show-note");
-    if (row.classList.contains("show-note")) noteInput.focus();
-  });
-  noteInput.addEventListener("input", () => {
-    const text = noteInput.value;
-    if (text.trim()) ctx.notes[path] = text;
-    else delete ctx.notes[path];
-    noteBtn.classList.toggle("has-note", Boolean(text.trim()));
-    ctx.onChange();
+    openNotePopover(noteBtn, {
+      path,
+      value: ctx.notes[path] || "",
+      label: node.label || "item",
+      onChange: (text) => {
+        if (text.trim()) ctx.notes[path] = text;
+        else delete ctx.notes[path];
+        noteBtn.classList.toggle("has-note", Boolean(text.trim()));
+        noteBtn.title = text.trim() ? "Edit field note" : "Field note";
+        ctx.onChange();
+      },
+    });
   });
 
   ctx.fieldEls.set(path, { row, diffEl: diff, node });
@@ -135,9 +255,13 @@ function renderField(container, node, path, parentObj, ctx) {
     extra.className = "btn small ghost";
     extra.innerHTML = '<i class="bi bi-plus-lg"></i>Add';
     extra.addEventListener("click", () => {
-      arr.push(defaultFor(node.item));
-      ctx.rerender();
-      ctx.onChange();
+      applyStructureChange(
+        ctx,
+        () => {
+          arr.push(defaultFor(node.item));
+        },
+        node.label || "array"
+      );
     });
     row.querySelector(".field-head").insertBefore(extra, row.querySelector(".note-btn"));
     const box = document.createElement("div");
@@ -165,9 +289,13 @@ function renderField(container, node, path, parentObj, ctx) {
         remove.className = "btn small ghost";
         remove.textContent = "Remove";
         remove.addEventListener("click", () => {
-          arr.splice(index, 1);
-          ctx.rerender();
-          ctx.onChange();
+          applyStructureChange(
+            ctx,
+            () => {
+              arr.splice(index, 1);
+            },
+            `${node.label || "array"}[${index + 1}]`
+          );
         });
         itemHead.appendChild(remove);
         wrap.appendChild(itemHead);
@@ -181,9 +309,13 @@ function renderField(container, node, path, parentObj, ctx) {
           removable: true,
         });
         itemRow.querySelector(".remove-btn").addEventListener("click", () => {
-          arr.splice(index, 1);
-          ctx.rerender();
-          ctx.onChange();
+          applyStructureChange(
+            ctx,
+            () => {
+              arr.splice(index, 1);
+            },
+            `${node.label || "array"}[${index + 1}]`
+          );
         });
         itemRow.querySelector(".field-control").appendChild(
           buildScalar(node.item, itemPath, item, (value) => {
@@ -242,6 +374,25 @@ function buildScalar(node, path, value, setValue, ctx) {
     if (node.type === "number") input.inputMode = "decimal";
   }
 
+  let committed = normalizeScalar(node, value);
+
+  const readInputValue = () => {
+    if (node.type === "boolean") {
+      return input.value === "" ? "" : input.value === "true";
+    }
+    return input.value;
+  };
+
+  const commitValue = () => {
+    const next = readInputValue();
+    if (next === committed) return;
+    const before = committed;
+    committed = next;
+    if (typeof ctx.onValueCommit === "function") {
+      ctx.onValueCommit({ path, before, after: next });
+    }
+  };
+
   const validate = () => {
     const problem = validateValue(node, input.value);
     if (entry) {
@@ -257,11 +408,13 @@ function buildScalar(node, path, value, setValue, ctx) {
     updateValue();
     validate();
     ctx.onChange();
+    commitValue();
   });
   input.addEventListener("change", () => {
     updateValue();
     validate();
     ctx.onChange();
+    commitValue();
   });
 
   function updateValue() {
@@ -331,7 +484,16 @@ export function applyDiff(container, fields, onRevert) {
 export function updateFieldNotes(container, notes) {
   const map = container._fieldMap || new Map();
   for (const [path, info] of map.entries()) {
-    const input = info.row.querySelector(".note-input");
-    if (input && document.activeElement !== input) input.value = notes[path] || "";
+    const text = notes[path] || "";
+    const btn = info.row.querySelector(".note-btn");
+    if (btn) btn.classList.toggle("has-note", Boolean(String(text).trim()));
+    if (
+      activeNotePopover &&
+      activeNotePopover.path === path &&
+      !activeNotePopover.el.contains(document.activeElement)
+    ) {
+      const input = activeNotePopover.el.querySelector(".note-input");
+      if (input) input.value = text;
+    }
   }
 }

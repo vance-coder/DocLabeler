@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
+import re
 import webbrowser
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import diffing
@@ -22,10 +26,187 @@ import projects
 import scanner
 import schema
 import store
-from paths import is_safe_id, resolve_images_dir
+from paths import is_safe_id, resolve_images_dir, safe_filename
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+
+
+# --------------------------------------------------------------------------
+# 备注聚合 / Prompt 草稿辅助
+# --------------------------------------------------------------------------
+
+def _norm_note(text: str) -> str:
+    """冲突比较用：去掉所有空白并转小写。"""
+    return "".join(str(text).split()).lower()
+
+
+def _notes_by_field(project) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for case_id, ann in store.list_annotations(project).items():
+        notes = ann.get("notes") or {}
+        if not isinstance(notes, dict):
+            continue
+        for path, text in notes.items():
+            text = str(text or "")
+            if not text.strip():
+                continue
+            grouped.setdefault(str(path), []).append({"case_id": case_id, "note": text})
+    for entries in grouped.values():
+        entries.sort(key=lambda item: item["case_id"])
+    return grouped
+
+
+def _node_for_path(schema_root: dict, path: str) -> dict | None:
+    try:
+        return schema.find_node(schema_root, schema.parse_path(path))
+    except schema.SchemaError:
+        return None
+
+
+def _notes_summary(project, schema_info: dict) -> dict:
+    grouped = _notes_by_field(project)
+    fields: list[dict] = []
+    total = 0
+    for path, entries in grouped.items():
+        total += len(entries)
+        node = _node_for_path(schema_info["schema"], path)
+        label = node["label"] if node else path
+        ftype = node["type"] if node else None
+
+        variant_counts: dict[str, int] = {}
+        for entry in entries:
+            variant_counts[entry["note"]] = variant_counts.get(entry["note"], 0) + 1
+        variants = [
+            {"note": note, "count": count}
+            for note, count in sorted(
+                variant_counts.items(), key=lambda item: (-item[1], item[0])
+            )
+        ]
+        fields.append(
+            {
+                "field_path": path,
+                "label": label,
+                "type": ftype,
+                "count": len(entries),
+                "case_count": len({entry["case_id"] for entry in entries}),
+                "notes": entries,
+                "variants": variants,
+                "conflict": len({_norm_note(entry["note"]) for entry in entries}) >= 2,
+            }
+        )
+    fields.sort(key=lambda item: (-item["count"], item["field_path"]))
+    return {"total_notes": total, "fields": fields}
+
+
+def _notes_csv_text(summary: dict) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["field_path", "note", "count", "case_ids"])
+    for field in summary["fields"]:
+        grouped: dict[str, list[str]] = {}
+        for entry in field["notes"]:
+            grouped.setdefault(entry["note"], []).append(entry["case_id"])
+        for note, case_ids in sorted(
+            grouped.items(), key=lambda item: (-len(item[1]), item[0])
+        ):
+            writer.writerow(
+                [field["field_path"], note, len(case_ids), ";".join(sorted(case_ids))]
+            )
+    return "\ufeff" + buffer.getvalue()
+
+
+def _template_regex(path: str) -> re.Pattern:
+    """把 ``items[].amount`` 模板转成可匹配 ``items[0].amount`` 的正则。"""
+    parts = path.split("[]")
+    return re.compile("^" + r"\[\d+\]".join(re.escape(part) for part in parts) + "$")
+
+
+def _prompt_payload(project, schema_info: dict) -> dict:
+    grouped = _notes_by_field(project)
+    annotations = store.list_annotations(project)
+    flattened = [
+        (case_id, schema.flatten_json((annotations[case_id].get("values") or {})))
+        for case_id in sorted(annotations)
+    ]
+
+    sections: list[dict] = []
+    for path, node in schema.iter_fields(schema_info["schema"]):
+        if node.get("type") not in schema.SCALAR_TYPES:
+            continue
+        pattern = _template_regex(path)
+
+        examples: list[str] = []
+        for _case_id, values in flattened:
+            for flat_path, raw in values.items():
+                if not pattern.match(flat_path):
+                    continue
+                if raw is None or isinstance(raw, (dict, list)):
+                    continue
+                text = str(raw)
+                if text.strip() and text not in examples:
+                    examples.append(text)
+
+        notes: list[str] = []
+        note_entries: list[dict] = []
+        for note_path, entries in grouped.items():
+            if pattern.match(note_path):
+                note_entries.extend(entries)
+        for entry in sorted(note_entries, key=lambda item: item["case_id"]):
+            if entry["note"] not in notes:
+                notes.append(entry["note"])
+
+        sections.append(
+            {
+                "field_path": path,
+                "label": node["label"],
+                "type": node["type"],
+                "description": node.get("description") or "",
+                "required": bool(node.get("required")),
+                "examples": examples[:3],
+                "notes": notes[:8],
+                "conflict": len({_norm_note(note) for note in notes}) >= 2,
+            }
+        )
+
+    lines = [f"# {project.name}", ""]
+    for section in sections:
+        lines.append(f"## {section['label']}")
+        lines.append(f"Path: {section['field_path']}")
+        lines.append(f"Type: {section['type']}")
+        lines.append(f"Required: {'yes' if section['required'] else 'no'}")
+        lines.append(f"Description: {section['description'] or '-'}")
+        lines.append("")
+        lines.append("Examples:")
+        if section["examples"]:
+            lines.extend(f"- {item}" for item in section["examples"])
+        else:
+            lines.append("- (none)")
+        lines.append("")
+        lines.append("Notes:")
+        if section["notes"]:
+            lines.extend(f"- {item}" for item in section["notes"])
+        else:
+            lines.append("- (none)")
+        if section["conflict"]:
+            lines.append("")
+            lines.append("Conflicting notes:")
+            lines.extend(f"- {item}" for item in section["notes"])
+        lines.append("")
+    return {"text": "\n".join(lines).strip() + "\n", "sections": sections}
+
+
+def _collection_path(project, name: str) -> Path:
+    return project.root / "collections" / f"{safe_filename(name, max_len=60)}.json"
+
+
+def _check_collection_name(name: str) -> str:
+    name = unquote(str(name or "")).strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Collection name cannot be empty")
+    if "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(status_code=400, detail="Invalid collection name")
+    return name
 
 
 def create_app(workspace: Path) -> FastAPI:
@@ -314,6 +495,92 @@ def create_app(workspace: Path) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc))
         return {"annotation": saved, "schema_version": info["version"]}
 
+    @app.post("/api/projects/{project_id}/annotations/bulk")
+    def api_bulk_annotations(project_id: str, payload: dict) -> dict:
+        project = _project(project_id)
+        index = _index(project)
+        info = _schema_info(project)
+
+        case_ids = payload.get("case_ids")
+        if not isinstance(case_ids, list) or not case_ids:
+            raise HTTPException(status_code=400, detail="case_ids must be a non-empty array")
+        action = str(payload.get("action") or "")
+        if action not in ("status", "add_tags", "remove_tags"):
+            raise HTTPException(status_code=400, detail="Invalid bulk action")
+
+        status: str | None = None
+        tags: list[str] = []
+        if action == "status":
+            status = str(payload.get("status") or "")
+            if status not in store.STATUSES:
+                raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+        else:
+            raw_tags = payload.get("tags")
+            if not isinstance(raw_tags, list):
+                raise HTTPException(status_code=400, detail="tags must be an array")
+            for tag in raw_tags:
+                text = str(tag).strip()
+                if text and text not in tags:
+                    tags.append(text)
+
+        by_id = scanner.index_map(index)
+        updated: list[dict] = []
+        skipped: list[dict] = []
+        for raw_case_id in case_ids:
+            case_id = str(raw_case_id)
+            case = by_id.get(case_id)
+            if case is None:
+                skipped.append({"case_id": case_id, "reason": "Case not found in this project"})
+                continue
+            ann = store.load_annotation(project, case_id) or store.make_annotation(
+                project, case, info
+            )
+            current_tags = [str(t) for t in (ann.get("tags") or [])]
+            new_status = ann.get("status") or "draft"
+            if action == "status":
+                new_status = status or new_status
+            elif action == "add_tags":
+                for tag in tags:
+                    if tag not in current_tags:
+                        current_tags.append(tag)
+            else:
+                current_tags = [tag for tag in current_tags if tag not in tags]
+            try:
+                saved = store.save_annotation(
+                    project,
+                    case,
+                    {
+                        "values": ann.get("values") or {},
+                        "notes": ann.get("notes") or {},
+                        "status": new_status,
+                        "tags": current_tags,
+                        "baseline_import_id": ann.get("baseline_import_id"),
+                    },
+                    info,
+                    expected_rev=int(ann.get("rev") or 0),
+                )
+            except store.RevConflict:
+                skipped.append(
+                    {
+                        "case_id": case_id,
+                        "reason": "Annotation was changed in another window",
+                    }
+                )
+                continue
+            except store.AnnotationError as exc:
+                skipped.append({"case_id": case_id, "reason": str(exc)})
+                continue
+            updated.append(
+                {
+                    "case_id": case_id,
+                    "rev": saved["rev"],
+                    "status": saved["status"],
+                    "tags": saved["tags"],
+                    "updated_at": saved["updated_at"],
+                }
+            )
+        return {"updated": len(updated), "skipped": skipped, "cases": updated}
+
     @app.get("/api/projects/{project_id}/diff/{case_id}")
     def api_diff(project_id: str, case_id: str) -> dict:
         project = _project(project_id)
@@ -338,18 +605,52 @@ def create_app(workspace: Path) -> FastAPI:
         if baseline is None:
             raise HTTPException(status_code=400, detail="This case has no baseline")
 
-        path = str(payload.get("path") or "")
-        try:
-            segs = schema.parse_path(path)
-        except schema.SchemaError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
         values = ann.get("values") or {}
-        old = schema.get_value(baseline, segs)
-        if old is None:
-            diffing.delete_value(values, segs)
+        revert_all = bool(payload.get("all"))
+        raw_paths: list[str] = []
+        if revert_all:
+            raw_paths = [item["path"] for item in diffing.compute_diff(values, baseline)]
         else:
+            if isinstance(payload.get("paths"), list):
+                raw_paths.extend(str(path) for path in payload["paths"])
+            if payload.get("path") is not None:
+                raw_paths.append(str(payload.get("path") or ""))
+        if not raw_paths:
+            raise HTTPException(status_code=400, detail="Missing path or paths")
+
+        reverted: list[str] = []
+        missing: list[str] = []
+        restores: list[tuple[str, list[Any], Any]] = []
+        deletions: list[tuple[str, list[Any]]] = []
+        seen: set[str] = set()
+        for path in raw_paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                segs = schema.parse_path(path)
+            except schema.SchemaError:
+                missing.append(path)
+                continue
+            if not segs:
+                missing.append(path)
+                continue
+            old = schema.get_value(baseline, segs)
+            if old is None:
+                deletions.append((path, segs))
+            else:
+                restores.append((path, segs, old))
+
+        for path, segs, old in restores:
             schema.set_value(values, segs, old)
+            reverted.append(path)
+        # 删除数组下标时从后往前处理，避免 pop 造成的下标位移
+        for path, segs in sorted(deletions, key=lambda item: item[0], reverse=True):
+            diffing.delete_value(values, segs)
+            if revert_all:
+                reverted.append(path)
+            else:
+                missing.append(path)
 
         saved = store.save_annotation(
             project,
@@ -364,7 +665,116 @@ def create_app(workspace: Path) -> FastAPI:
             info,
             expected_rev=payload.get("expected_rev"),
         )
-        return {"annotation": saved}
+        return {"annotation": saved, "reverted": reverted, "missing": missing}
+
+    # ------------------------------------------------------------------
+    # Collections
+    # ------------------------------------------------------------------
+    @app.get("/api/projects/{project_id}/collections")
+    def api_list_collections(project_id: str) -> dict:
+        project = _project(project_id)
+        directory = project.root / "collections"
+        items: list[dict] = []
+        if directory.exists():
+            for path in directory.glob("*.json"):
+                data = jsonio.read_json(path)
+                if not isinstance(data, dict):
+                    continue
+                items.append(
+                    {
+                        "name": data.get("name") or path.stem,
+                        "count": len(data.get("case_ids") or []),
+                        "updated_at": data.get("updated_at"),
+                    }
+                )
+        items.sort(key=lambda item: str(item["name"]))
+        return {"collections": items}
+
+    @app.get("/api/projects/{project_id}/collections/{name}")
+    def api_get_collection(project_id: str, name: str) -> dict:
+        project = _project(project_id)
+        name = _check_collection_name(name)
+        data = jsonio.read_json(_collection_path(project, name))
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=404, detail="Collection not found")
+        return {
+            "name": data.get("name") or name,
+            "case_ids": list(data.get("case_ids") or []),
+            "updated_at": data.get("updated_at"),
+        }
+
+    @app.put("/api/projects/{project_id}/collections/{name}")
+    def api_put_collection(project_id: str, name: str, payload: dict) -> dict:
+        project = _project(project_id)
+        name = _check_collection_name(name)
+        index = _index(project)
+
+        raw_ids = payload.get("case_ids")
+        if not isinstance(raw_ids, list):
+            raise HTTPException(status_code=400, detail="case_ids must be an array")
+        case_ids: list[str] = []
+        for raw in raw_ids:
+            case_id = str(raw)
+            if case_id and case_id not in case_ids:
+                case_ids.append(case_id)
+
+        known = set(scanner.index_map(index))
+        unknown = [case_id for case_id in case_ids if case_id not in known]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail={"message": "Unknown case IDs", "unknown": unknown},
+            )
+
+        path = _collection_path(project, name)
+        existing = jsonio.read_json(path)
+        now = schema.now_iso()
+        created_at = (
+            existing.get("created_at")
+            if isinstance(existing, dict) and existing.get("created_at")
+            else now
+        )
+        record = {
+            "name": name,
+            "case_ids": case_ids,
+            "created_at": created_at,
+            "updated_at": now,
+        }
+        jsonio.write_json(path, record)
+        return {"name": name, "case_ids": case_ids, "updated_at": now}
+
+    @app.delete("/api/projects/{project_id}/collections/{name}")
+    def api_delete_collection(project_id: str, name: str) -> dict:
+        project = _project(project_id)
+        name = _check_collection_name(name)
+        path = _collection_path(project, name)
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="Collection not found")
+        path.unlink()
+        return {"deleted": True}
+
+    # ------------------------------------------------------------------
+    # 备注聚合 / Prompt 草稿
+    # ------------------------------------------------------------------
+    @app.get("/api/projects/{project_id}/notes/summary")
+    def api_notes_summary(project_id: str) -> dict:
+        project = _project(project_id)
+        return _notes_summary(project, _schema_info(project))
+
+    @app.get("/api/projects/{project_id}/notes/summary.csv")
+    def api_notes_summary_csv(project_id: str):
+        project = _project(project_id)
+        text = _notes_csv_text(_notes_summary(project, _schema_info(project)))
+        return Response(
+            content=text,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="notes_summary.csv"'},
+        )
+
+    @app.get("/api/projects/{project_id}/prompt")
+    def api_prompt(project_id: str) -> dict:
+        project = _project(project_id)
+        return _prompt_payload(project, _schema_info(project))
 
     # ------------------------------------------------------------------
     # 导入

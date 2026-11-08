@@ -18,6 +18,13 @@
     <div class="topbar-center" id="topbar-center"></div>
     <div class="topbar-actions" id="topbar-actions"></div>
   </header>
+  <div id="conflict-banner" class="conflict-banner" role="alert" hidden>
+    <i class="bi bi-exclamation-triangle" aria-hidden="true"></i>
+    <span class="conflict-text">This case was changed in another window</span>
+    <span class="flex-grow-1"></span>
+    <button type="button" class="btn small" id="btn-conflict-reload">Reload</button>
+    <button type="button" class="btn small primary" id="btn-conflict-keep">Keep mine</button>
+  </div>
   <main id="view" class="view"></main>
   <div id="modal-root"></div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
