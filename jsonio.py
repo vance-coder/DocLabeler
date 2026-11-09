@@ -23,7 +23,8 @@ def write_json(path: str | Path, data: Any) -> None:
     fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            # NaN / Infinity 不是合法 JSON，宁可写失败也不要产出下游无法解析的文件。
+            json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, p)

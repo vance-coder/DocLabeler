@@ -114,6 +114,7 @@ export function renderForm(container, ctx) {
   const local = {
     ...ctx,
     notes: ctx.notes || {},
+    evidence: ctx.evidence || {},
     fieldEls,
     rerender: () => renderForm(container, ctx),
   };
@@ -125,6 +126,7 @@ export function renderForm(container, ctx) {
   renderChildren(container, local.schema, local.values || {}, local, "");
   applyDiff(container, local.diffFields || [], local.onRevert);
   if (typeof local.onRender === "function") local.onRender(container);
+  if (typeof local.onValidate === "function") local.onValidate();
 }
 
 function cloneValues(value) {
@@ -185,6 +187,7 @@ function makeFieldRow(node, path, ctx, options = {}) {
   const note = ctx.notes ? ctx.notes[path] || "" : "";
   const rawConfidence = ctx.confidence ? ctx.confidence[path] : undefined;
   const confidence = typeof rawConfidence === "number" ? rawConfidence : null;
+  const hasEvidence = Boolean(ctx.evidence && ctx.evidence[path]);
   const confidenceHtml =
     confidence !== null && confidence < LOW_CONFIDENCE
       ? `<span class="conf-badge" title="Model confidence ${Math.round(confidence * 100)}% (below ${Math.round(LOW_CONFIDENCE * 100)}%)">${Math.round(confidence * 100)}%</span>`
@@ -199,6 +202,7 @@ function makeFieldRow(node, path, ctx, options = {}) {
     <span class="type-tag">${TYPE_LABELS[node.type] || node.type}</span>
     ${confidenceHtml}
     ${options.extraHead || ""}
+    <button type="button" class="evidence-btn${hasEvidence ? " has-evidence" : ""}" title="${hasEvidence ? "Locate in image" : "Draw region in image"} · Shift+click redraw · Alt+click remove" aria-label="Locate field in image"><i class="bi bi-bounding-box" aria-hidden="true"></i></button>
     <button type="button" class="note-btn${String(note).trim() ? " has-note" : ""}" title="${String(note).trim() ? "Edit field note" : "Field note"}" aria-label="Field note for ${escapeHtml(node.label || "item")}" aria-haspopup="dialog"><i class="bi bi-sticky" aria-hidden="true"></i></button>
   `;
   if (options.removable) {
@@ -222,6 +226,16 @@ function makeFieldRow(node, path, ctx, options = {}) {
   msg.className = "field-msg";
   row.appendChild(msg);
 
+  const ruleMsg = document.createElement("div");
+  ruleMsg.className = "field-validation";
+  row.appendChild(ruleMsg);
+
+  const evidenceBtn = head.querySelector(".evidence-btn");
+  if (evidenceBtn) {
+    evidenceBtn.addEventListener("click", (event) => {
+      if (typeof ctx.onLocate === "function") ctx.onLocate(path, event);
+    });
+  }
   const noteBtn = head.querySelector(".note-btn");
   noteBtn.addEventListener("click", () => {
     openNotePopover(noteBtn, {
@@ -417,12 +431,14 @@ function buildScalar(node, path, value, setValue, ctx) {
     validate();
     ctx.onChange();
     commitValue();
+    if (typeof ctx.onValidate === "function") ctx.onValidate();
   });
   input.addEventListener("change", () => {
     updateValue();
     validate();
     ctx.onChange();
     commitValue();
+    if (typeof ctx.onValidate === "function") ctx.onValidate();
   });
 
   function updateValue() {
@@ -487,6 +503,27 @@ export function applyDiff(container, fields, onRevert) {
     }
     info.diffEl.appendChild(line);
   }
+}
+
+export function applyValidation(container, errors) {
+  const map = container._fieldMap || new Map();
+  const grouped = new Map();
+  for (const error of errors || []) {
+    if (!error || !error.path) continue;
+    if (!grouped.has(error.path)) grouped.set(error.path, []);
+    grouped.get(error.path).push(error.message || error.rule || "Invalid");
+  }
+  container._validationMap = grouped;
+  for (const [path, info] of map.entries()) {
+    const messages = grouped.get(path) || [];
+    info.row.classList.toggle("rule-invalid", messages.length > 0);
+    const node = info.row.querySelector(".field-validation");
+    if (node) {
+      node.textContent = messages.join(" · ");
+      node.title = messages.join("\n");
+    }
+  }
+  return grouped;
 }
 
 export function updateFieldNotes(container, notes) {

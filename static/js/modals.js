@@ -39,36 +39,44 @@ export function openCreateProjectModal({ onCreated }) {
   const imagesDir = textInput("Absolute path, or a path relative to the workspace");
   const description = textInput("Optional");
 
-  const modeWrap = mk("div", "radio-row");
-  modeWrap.innerHTML = `
-    <label><input type="radio" name="schema-mode" value="empty" checked /> Empty schema</label>
-    <label><input type="radio" name="schema-mode" value="example" /> Infer from example JSON</label>
-    <label><input type="radio" name="schema-mode" value="json_schema" /> Import JSON Schema</label>
-  `;
+  // 浏览器无法把本地文件夹的绝对路径交给网页，所以 Browse 由本地后端弹出系统对话框。
+  const imagesWrap = mk("div", "path-row");
+  imagesWrap.style.display = "flex";
+  imagesWrap.style.gap = "8px";
+  imagesDir.style.flex = "1";
+  const browseBtn = mk("button", "btn");
+  browseBtn.type = "button";
+  browseBtn.textContent = "Browse…";
+  browseBtn.addEventListener("click", async () => {
+    browseBtn.disabled = true;
+    browseBtn.textContent = "Waiting…";
+    try {
+      const res = await api.post("/api/fs/pick-folder", { initial: imagesDir.value.trim() });
+      if (res.path) imagesDir.value = res.path;
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      browseBtn.disabled = false;
+      browseBtn.textContent = "Browse…";
+    }
+  });
+  imagesWrap.appendChild(imagesDir);
+  imagesWrap.appendChild(browseBtn);
 
   const exampleArea = mk("textarea");
   exampleArea.placeholder = '{\n  "doc_no": "A-001",\n  "total": "3040",\n  "items": [{"description": "CT Brain", "amount": "3040"}]\n}';
-  const exampleRow = fieldRow("Example JSON", exampleArea, "Arrays are inferred as repeatable groups. The sample only illustrates the structure.");
-  exampleRow.style.display = "none";
-
-  const schemaArea = mk("textarea");
-  schemaArea.placeholder = '{"type":"object","properties":{...}}';
-  const schemaRow = fieldRow("JSON Schema", schemaArea, "Supports type / properties / items / required / enum / description.");
-  schemaRow.style.display = "none";
-
-  modeWrap.addEventListener("change", () => {
-    const mode = modeWrap.querySelector("input:checked").value;
-    exampleRow.style.display = mode === "example" ? "" : "none";
-    schemaRow.style.display = mode === "json_schema" ? "" : "none";
-  });
 
   const message = mk("div", "schema-msg");
   modal.body.appendChild(fieldRow("Project name", name));
-  modal.body.appendChild(fieldRow("Images folder", imagesDir, "The tool only reads this folder. Original images are never modified, moved, or deleted."));
+  modal.body.appendChild(fieldRow("Images folder", imagesWrap, "The tool only reads this folder. Original images are never modified, moved, or deleted."));
   modal.body.appendChild(fieldRow("Description", description));
-  modal.body.appendChild(fieldRow("Schema source", modeWrap));
-  modal.body.appendChild(exampleRow);
-  modal.body.appendChild(schemaRow);
+  modal.body.appendChild(
+    fieldRow(
+      "Example JSON",
+      exampleArea,
+      "Optional. Paste one sample output to infer fields; leave empty to start with an empty schema."
+    )
+  );
   modal.body.appendChild(message);
 
   const cancel = mk("button", "btn");
@@ -79,24 +87,29 @@ export function openCreateProjectModal({ onCreated }) {
   submit.textContent = "Create project";
   submit.addEventListener("click", async () => {
     submit.disabled = true;
+    submit.textContent = "Creating…";
     message.textContent = "";
-    const mode = modeWrap.querySelector("input:checked").value;
+    const exampleJson = exampleArea.value.trim();
     try {
       const res = await api.post("/api/projects", {
         name: name.value.trim(),
         images_dir: imagesDir.value.trim(),
         description: description.value.trim(),
-        schema_mode: mode,
-        example_json: exampleArea.value,
-        json_schema: schemaArea.value,
+        schema_mode: exampleJson ? "example" : "empty",
+        example_json: exampleJson,
       });
       toast(`Project "${res.project.name}" created`);
       modal.close();
       if (onCreated) onCreated(res.project);
     } catch (error) {
+      // 错误既写在弹窗底部，也弹 toast：扫描大目录时用户可能正看向别处。
       message.textContent = error.message;
+      message.scrollIntoView({ block: "nearest" });
+      toast(error.message, true);
+      console.error(error);
     } finally {
       submit.disabled = false;
+      submit.textContent = "Create project";
     }
   });
 
@@ -171,7 +184,7 @@ export function openImportModal({ projectId, onDone }) {
 
   const help = mk("div", "help");
   help.innerHTML =
-    "Long-format columns: <span class='mono'>case_id, field_path, value, note</span>; optional <span class='mono'>confidence</span> (0-1 or 0-100) flags low-confidence fields. field_path looks like <span class='mono'>items[0].amount</span>.";
+    "Long-format columns: <span class='mono'>case_id, field_path, value, note</span>; optional <span class='mono'>confidence</span> (0-1 or 0-100), <span class='mono'>bbox</span> (normalized x,y,w,h), <span class='mono'>text</span> and <span class='mono'>page</span> link a field to its image region. field_path looks like <span class='mono'>items[0].amount</span>.";
 
   const result = mk("div");
   result.style.marginTop = "14px";
@@ -274,17 +287,28 @@ export function openExportModal({
   `;
 
   const label = textInput("Optional, appended to the export folder name");
+  const cropsWrap = mk("label", "review-check");
+  const cropsToggle = mk("input");
+  cropsToggle.type = "checkbox";
+  cropsToggle.checked = true;
+  cropsWrap.appendChild(cropsToggle);
+  cropsWrap.appendChild(
+    Object.assign(mk("span"), {
+      textContent: " Export field crop images from linked regions",
+    })
+  );
   const result = mk("div");
   result.style.marginTop = "14px";
 
   modal.body.appendChild(fieldRow("Scope", scope));
   modal.body.appendChild(fieldRow("Version label", label));
+  modal.body.appendChild(fieldRow("Evidence", cropsWrap));
   modal.body.appendChild(
     fieldRow(
       "Contents",
       Object.assign(mk("div", "muted"), {
         textContent:
-          "manifest.csv / manifest.json / schema.json / fields.csv / summary.csv / cases/<case_id>/{image.png,label.json,notes.csv}",
+          "manifest.csv / manifest.json / schema.json / fields.csv / summary.csv / evidence.csv / cases/<case_id>/{image.png,label.json,notes.csv,evidence.csv,crops/*.png}",
       })
     )
   );
@@ -309,11 +333,19 @@ export function openExportModal({
       const res = await api.post(projectUrl(projectId, "/exports"), {
         case_ids: caseIds,
         label: label.value.trim(),
+        include_crops: cropsToggle.checked,
       });
       toast(`Exported ${res.case_count} cases to exports/${res.version}`);
+      // 缺图 / 裁剪失败不再被静默吞掉：给出数量提示，明细在 manifest.json 的 warnings 里。
+      if (res.warning_count) {
+        toast(`${res.warning_count} item(s) skipped — see warnings in manifest.json`, true);
+      }
       result.innerHTML = `
         <div class="stat-grid">
           <div class="stat-card"><div class="num">${res.case_count}</div><div class="label">Cases</div></div>
+          <div class="stat-card"><div class="num">${res.evidence_count ?? 0}</div><div class="label">Linked regions</div></div>
+          <div class="stat-card"><div class="num">${res.crop_count ?? 0}</div><div class="label">Crop images</div></div>
+          <div class="stat-card"><div class="num">${res.warning_count ?? 0}</div><div class="label">Warnings</div></div>
         </div>
         <div class="muted" style="margin-bottom:8px">
           Export folder: <span class="mono">${escapeHtml(res.relative_dir)}</span>

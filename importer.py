@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import re
 import uuid
 from datetime import datetime
@@ -34,6 +35,21 @@ HEADER_ALIASES = {
     "conf": "confidence",
     "置信度": "confidence",
     "置信分数": "confidence",
+    "box": "bbox",
+    "框": "bbox",
+    "坐标": "bbox",
+    "text": "evidence_text",
+    "ocr_text": "evidence_text",
+    "evidence_text": "evidence_text",
+    "ocr": "evidence_text",
+    "page": "page",
+    "页": "page",
+    "source": "source",
+    "file": "source",
+    "filename": "source",
+    "image": "source",
+    "文件": "source",
+    "图片": "source",
 }
 
 
@@ -60,22 +76,40 @@ def _decode(data: bytes) -> str:
     raise ImportFailed("Unable to detect file encoding")
 
 
+def _table_layout(raw_headers: list[str], label: str) -> tuple[list[str], bool]:
+    """识别长表 / 宽表，返回 (归一化表头, 是否宽表)。
+
+    长表必须同时有 ``field_path`` 与 ``value``；否则按宽表处理：一行一个 case，
+    列名直接对应 schema 的字段路径或标签（导出目录里的 summary.csv 即可回灌）。
+    宽表行保留原始表头，避免 ``text`` / ``path`` 这类列名被长表别名改写。
+    """
+    headers = [_norm_header(name) for name in raw_headers]
+    wide = not ("field_path" in headers and "value" in headers)
+    if wide and "case_id" not in headers and "source" not in headers:
+        raise ImportFailed(
+            f"{label} needs either field_path + value columns (long format), "
+            "or case_id / source columns (wide format)"
+        )
+    return headers, wide
+
+
 def parse_csv(data: bytes) -> list[dict]:
     text = _decode(data)
     reader = csv.reader(io.StringIO(text))
     rows = list(reader)
     if not rows:
         raise ImportFailed("CSV file is empty")
-    headers = [_norm_header(h) for h in rows[0]]
-    for need in ("case_id", "field_path", "value"):
-        if need not in headers:
-            raise ImportFailed(f"CSV is missing required column: {need}")
+    raw_headers = [str(name or "").strip() for name in rows[0]]
+    normalized, wide = _table_layout(raw_headers, "CSV")
+    keys = raw_headers if wide else normalized
     out: list[dict] = []
     for line_no, raw_row in enumerate(rows[1:], start=2):
         if not any(str(c).strip() for c in raw_row):
             continue
-        row = {headers[i]: (raw_row[i] if i < len(raw_row) else "") for i in range(len(headers))}
+        row = {keys[i]: (raw_row[i] if i < len(raw_row) else "") for i in range(len(keys))}
         row["_line"] = line_no
+        if wide:
+            row["_wide"] = True
         out.append(row)
     return out
 
@@ -93,19 +127,20 @@ def parse_excel(data: bytes) -> list[dict]:
         rows.append(list(row))
     if not rows:
         raise ImportFailed("Excel worksheet is empty")
-    headers = [_norm_header(str(h) if h is not None else "") for h in rows[0]]
-    for need in ("case_id", "field_path", "value"):
-        if need not in headers:
-            raise ImportFailed(f"Excel is missing required column: {need}")
+    raw_headers = [str(name).strip() if name is not None else "" for name in rows[0]]
+    normalized, wide = _table_layout(raw_headers, "Excel")
+    keys = raw_headers if wide else normalized
     out: list[dict] = []
     for line_no, raw_row in enumerate(rows[1:], start=2):
         if not any(str(c).strip() for c in raw_row if c is not None):
             continue
         row = {
-            headers[i]: ("" if i >= len(raw_row) or raw_row[i] is None else str(raw_row[i]))
-            for i in range(len(headers))
+            keys[i]: ("" if i >= len(raw_row) or raw_row[i] is None else str(raw_row[i]))
+            for i in range(len(keys))
         }
         row["_line"] = line_no
+        if wide:
+            row["_wide"] = True
         out.append(row)
     wb.close()
     return out
@@ -140,6 +175,7 @@ def parse_json_case(filename: str, data: bytes) -> dict:
     values = payload.get("values") if isinstance(payload.get("values"), dict) else None
     notes = payload.get("notes")
     confidence = payload.get("confidence") if isinstance(payload.get("confidence"), dict) else {}
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
     if values is None:
         reserved = {
             "case_id",
@@ -150,6 +186,7 @@ def parse_json_case(filename: str, data: bytes) -> dict:
             "tags",
             "notes",
             "confidence",
+            "evidence",
             "rev",
             "updated_at",
         }
@@ -161,7 +198,25 @@ def parse_json_case(filename: str, data: bytes) -> dict:
         "values": schema.flatten_json(values or {}),
         "notes": _flatten_notes(notes),
         "confidence": schema.flatten_json(confidence),
+        "evidence": evidence,
     }
+
+
+def _parse_bbox(raw: Any) -> dict | None:
+    """接受 ``x,y,w,h`` 归一化坐标（0-1，也兼容 0-100）。"""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    parts = [part for part in re.split(r"[,;\s]+", text) if part]
+    if len(parts) != 4:
+        return None
+    try:
+        numbers = [float(part) for part in parts]
+    except ValueError:
+        return None
+    if all(math.isfinite(n) for n in numbers) and all(n > 1 for n in numbers):
+        numbers = [number / 100 for number in numbers]
+    return store.normalize_evidence({"box": {"bbox": numbers}}).get("box")
 
 
 def _is_empty(value: Any) -> bool:
@@ -179,9 +234,28 @@ def _parse_confidence(raw: Any) -> float | None:
         value = float(text)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(value):
+        return None
     if value > 1:
         value = value / 100 if value <= 100 else 1.0
     return max(0.0, min(1.0, value))
+
+
+def _coerce_import_value(node: dict, raw: Any) -> tuple[bool, Any, str | None]:
+    """宽表里的数组列以 JSON 字符串表示；其余类型沿用 schema.coerce_value。"""
+    if node.get("type") == "array":
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return True, [], None
+            try:
+                raw = json.loads(text)
+            except json.JSONDecodeError as exc:
+                return False, None, f"Array must be valid JSON ({exc.msg})"
+        if not isinstance(raw, list):
+            return False, None, "Array must be a JSON array"
+        return True, raw, None
+    return schema.coerce_value(node, raw)
 
 
 def run_import(
@@ -200,6 +274,27 @@ def run_import(
 
     import_id = new_import_id()
     root = schema_info["schema"]
+    # 宽表列名 -> (field_path, segments, node)。完整路径优先，标签兜底；
+    # 同名标签指向多个字段时视为歧义，宁可报 unknown_field 也不猜一个。
+    wide_map: dict[str, tuple[str, list, dict]] = {}
+    wide_ambiguous: set[str] = set()
+    for wide_path, wide_label, wide_node in schema.wide_columns(root):
+        try:
+            wide_segs = schema.parse_path(wide_path)
+        except schema.SchemaError:
+            continue
+        for key in {
+            wide_path.lower(),
+            wide_label.lower(),
+            wide_path.rsplit(".", 1)[-1].lower(),
+        }:
+            existing = wide_map.get(key)
+            if existing is not None and existing[0] != wide_path:
+                wide_ambiguous.add(key)
+            else:
+                wide_map.setdefault(key, (wide_path, wide_segs, wide_node))
+    for key in wide_ambiguous:
+        wide_map.pop(key, None)
     by_id = {c["case_id"]: c for c in index.get("cases", [])}
     by_source: dict[str, str] = {}
     by_source_noext: dict[str, str] = {}
@@ -216,6 +311,7 @@ def run_import(
         "kept_values": 0,
         "confidence": 0,
         "notes": 0,
+        "evidence": 0,
         "skipped_fill": 0,
         "unknown_case": 0,
         "ambiguous_case": 0,
@@ -307,8 +403,113 @@ def run_import(
     def add_group(case_id: str) -> dict:
         return grouped.setdefault(
             case_id,
-            {"values": [], "notes": [], "confidence": {}, "baseline": {}, "baseline_notes": {}},
+            {
+                "values": [],
+                "notes": [],
+                "confidence": {},
+                "evidence": {},
+                "baseline": {},
+                "baseline_notes": {},
+                "baseline_evidence": {},
+                "status": "",
+            },
         )
+
+    def ingest_wide_row(filename: str, row: dict) -> None:
+        """宽表一行 = 一个 case；列名按 schema 路径 / 标签匹配。"""
+        stats["rows"] += 1
+        line = row.get("_line")
+        values_by_key: dict[str, Any] = {}
+        for key, value in row.items():
+            if not key or str(key).startswith("_"):
+                continue
+            values_by_key[str(key).strip().lower()] = value
+        raw_case = str(values_by_key.get("case_id") or "").strip()
+        raw_source = str(values_by_key.get("source") or "").strip()
+        raw_key = raw_case or raw_source
+        if not raw_key:
+            stats["unknown_case"] += 1
+            issues.append(
+                {
+                    "case_id": None,
+                    "field_path": None,
+                    "type": "unknown_case",
+                    "message": f"{filename} line {line}: Missing case ID / source",
+                    "line": line,
+                }
+            )
+            return
+        case_id = resolve_case(raw_key)
+        if not case_id:
+            stats["unknown_case"] += 1
+            issues.append(
+                {
+                    "case_id": raw_key,
+                    "field_path": None,
+                    "type": "unknown_case",
+                    "message": (
+                        f"{raw_key} is not in the current project's image list "
+                        "(no exact case ID or matching path token)"
+                    ),
+                    "line": line,
+                }
+            )
+            return
+        group = add_group(case_id)
+        for header, value in values_by_key.items():
+            if header in ("case_id", "source", "status", "notes"):
+                continue
+            entry = wide_map.get(header)
+            if entry is None:
+                stats["unknown_field"] += 1
+                issues.append(
+                    {
+                        "case_id": case_id,
+                        "field_path": header,
+                        "type": "unknown_field",
+                        "message": (
+                            "This column matches more than one schema field; use its full path"
+                            if header in wide_ambiguous
+                            else "No schema field matches this column"
+                        ),
+                        "line": line,
+                    }
+                )
+                continue
+            field_path = entry[0]
+            group["values"].append(
+                {"case_id": case_id, "field_path": field_path, "value": value, "line": line}
+            )
+        raw_notes = str(values_by_key.get("notes") or "").strip()
+        if raw_notes:
+            try:
+                notes_obj = json.loads(raw_notes)
+            except json.JSONDecodeError:
+                notes_obj = None
+            if isinstance(notes_obj, dict):
+                for note_path, note_text in notes_obj.items():
+                    if note_text is None or not str(note_text).strip():
+                        continue
+                    group["notes"].append(
+                        {
+                            "case_id": case_id,
+                            "field_path": str(note_path),
+                            "note": str(note_text),
+                        }
+                    )
+            else:
+                issues.append(
+                    {
+                        "case_id": case_id,
+                        "field_path": "notes",
+                        "type": "unknown_field",
+                        "message": "The notes column must be a JSON object of {path: text}",
+                        "line": line,
+                    }
+                )
+        status = str(values_by_key.get("status") or "").strip()
+        if status:
+            group["status"] = status
 
     # ---------- 解析为按 case 分组 ----------
     for upload in uploads:
@@ -342,10 +543,17 @@ def run_import(
                 group["confidence"][path] = conf
             for path, note in parsed["notes"].items():
                 group["notes"].append({"case_id": case_id, "field_path": path, "note": note})
+            for path, box in parsed["evidence"].items():
+                normalized = store.normalize_evidence({path: box}).get(path)
+                if normalized:
+                    group["evidence"][path] = normalized
             continue
 
         rows = parse_csv(data) if kind == "csv" else parse_excel(data)
         for row in rows:
+            if row.get("_wide"):
+                ingest_wide_row(filename, row)
+                continue
             stats["rows"] += 1
             raw_case_id = str(row.get("case_id") or "").strip()
             if not raw_case_id:
@@ -388,6 +596,14 @@ def run_import(
             confidence = str(row.get("confidence") or "").strip()
             if confidence:
                 group["confidence"][str(row.get("field_path") or "").strip()] = confidence
+            box = _parse_bbox(row.get("bbox"))
+            if box:
+                box["text"] = str(row.get("evidence_text") or "").strip()[:2000]
+                try:
+                    box["page"] = max(0, int(row.get("page") or 0))
+                except (TypeError, ValueError):
+                    box["page"] = 0
+                group["evidence"][str(row.get("field_path") or "").strip()] = box
             note = str(row.get("note") or "")
             if note.strip():
                 group["notes"].append(
@@ -414,6 +630,7 @@ def run_import(
             if isinstance(ann.get("confidence"), dict)
             else {}
         )
+        evidence = store.normalize_evidence(ann.get("evidence"))
         baseline_confidence: dict[str, float] = {}
 
         for item in group["values"]:
@@ -457,7 +674,7 @@ def run_import(
                     }
                 )
                 continue
-            ok, value, error = schema.coerce_value(node, item.get("value"))
+            ok, value, error = _coerce_import_value(node, item.get("value"))
             if not ok:
                 stats["type_mismatch"] += 1
                 issues.append(
@@ -473,18 +690,26 @@ def run_import(
                 continue
             # baseline 始终记录导入值，作为差异比较的参照（即使 fill_empty 未写入当前标注）
             schema.set_value(group["baseline"], segs, value)
+            box = group["evidence"].get(path)
+            if box:
+                group["baseline_evidence"][path] = box
             parsed_confidence = _parse_confidence(group["confidence"].get(path))
             if parsed_confidence is not None:
-                confidence[path] = parsed_confidence
                 baseline_confidence[path] = parsed_confidence
                 stats["confidence"] += 1
             if mode == "baseline":
-                # 只刷新 baseline，保留人工修正后的当前值与备注
+                # 只刷新 baseline 快照；人工修正过的值、备注、证据框、置信度都保持不动
                 stats["kept_values"] += 1
                 continue
             if mode == "fill_empty" and not _is_empty(schema.get_value(values, segs)):
                 stats["skipped_fill"] += 1
                 continue
+            # 只有真正写入当前值时才同步证据框与置信度，
+            # 避免「值被跳过、证据却被预测覆盖」的不一致。
+            if box:
+                evidence[path] = box
+            if parsed_confidence is not None:
+                confidence[path] = parsed_confidence
             schema.set_value(values, segs, value)
             stats["applied_fields"] += 1
 
@@ -501,11 +726,32 @@ def run_import(
             group["baseline_notes"][path] = item["note"]
             if mode == "baseline":
                 continue
+            if mode == "fill_empty" and str(notes.get(path) or "").strip():
+                # 人工备注优先：值和备注都只在为空时补，预测不能覆盖人工结论。
+                continue
             notes[path] = item["note"]
             stats["notes"] += 1
 
+        stats["evidence"] += len(group["baseline_evidence"])
+
         if _is_empty(group["baseline"]) and not group["baseline_notes"]:
             continue
+
+        status = ann.get("status") or "draft"
+        group_status = str(group.get("status") or "").strip()
+        if group_status:
+            if group_status in store.STATUSES:
+                status = group_status
+            else:
+                issues.append(
+                    {
+                        "case_id": case_id,
+                        "field_path": "status",
+                        "type": "invalid_status",
+                        "message": f"Unknown status: {group_status}",
+                        "line": None,
+                    }
+                )
 
         saved = store.save_annotation(
             project,
@@ -514,7 +760,8 @@ def run_import(
                 "values": values,
                 "notes": notes,
                 "confidence": confidence,
-                "status": ann.get("status") or "draft",
+                "evidence": evidence,
+                "status": status,
                 "tags": ann.get("tags") or [],
                 "baseline_import_id": import_id,
             },
@@ -533,6 +780,7 @@ def run_import(
                 "values": group["baseline"],
                 "notes": group["baseline_notes"],
                 "confidence": baseline_confidence,
+                "evidence": group["baseline_evidence"],
             },
         )
         touched.append(case_id)

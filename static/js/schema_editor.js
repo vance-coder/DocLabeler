@@ -22,6 +22,7 @@ function newNode(label, type) {
     required: false,
     description: "",
     enum: [],
+    validation: [],
   };
   if (type === "object") node.children = [];
   if (type === "array") node.item = newNode("item", "string");
@@ -58,11 +59,57 @@ export function openSchemaEditor({ projectId, schemaInfo, onSaved }) {
   const hint = mk("div", "muted");
   hint.style.marginBottom = "10px";
   hint.textContent =
-    "Field names are keys in the annotation JSON and must be unique among siblings. Renaming migrates existing annotations; field ids stay the same.";
+    "Field names are keys in the annotation JSON and must be unique among siblings. Renaming migrates existing annotations; field ids stay the same. Use Rules on root or any field for cross-field checks (sum / regex / date / compare / range / length / checksum).";
   modal.body.appendChild(hint);
 
   const message = mk("div", "schema-msg");
   modal.body.appendChild(message);
+  const ruleErrors = new Map();
+  const updateRuleMessage = () => {
+    if (!ruleErrors.size) {
+      if (message.textContent.startsWith("Invalid rules")) message.textContent = "";
+      return;
+    }
+    message.textContent = `Invalid rules: ${[...ruleErrors.values()].join(" · ")}`;
+  };
+
+  function renderRules(container, node) {
+    const box = mk("div", "schema-rules");
+    const count = (node.validation || []).length;
+    const toggle = mk("button", "btn small ghost");
+    toggle.type = "button";
+    toggle.textContent = `Rules${count ? ` (${count})` : ""}`;
+    const area = mk("textarea", "rules-input");
+    area.placeholder =
+      '[{"type":"sum","target":"total","source":"items[].amount","tolerance":0.01}]';
+    area.spellcheck = false;
+    area.value = JSON.stringify(node.validation || [], null, 2);
+    area.hidden = true;
+    toggle.addEventListener("click", () => {
+      area.hidden = !area.hidden;
+      if (!area.hidden) area.focus();
+    });
+    area.addEventListener("input", () => {
+      const text = area.value.trim();
+      if (!text) {
+        node.validation = [];
+        ruleErrors.delete(node);
+      } else {
+        try {
+          const parsed = JSON.parse(text);
+          node.validation = Array.isArray(parsed) ? parsed : [parsed];
+          ruleErrors.delete(node);
+        } catch (error) {
+          ruleErrors.set(node, `Invalid JSON (${error.message})`);
+        }
+      }
+      toggle.textContent = `Rules${(node.validation || []).length ? ` (${node.validation.length})` : ""}`;
+      updateRuleMessage();
+    });
+    box.appendChild(toggle);
+    box.appendChild(area);
+    container.appendChild(box);
+  }
 
   const tree = mk("div");
   modal.body.appendChild(tree);
@@ -150,16 +197,17 @@ export function openSchemaEditor({ projectId, schemaInfo, onSaved }) {
       });
       row.appendChild(descInput);
 
-      const actions = mk("div", "schema-actions");
+      // 不要叫 actions：那是 state.js 里的跨模块函数注册表。
+      const actionRow = mk("div", "schema-actions");
       if (node.type === "object") {
-        actions.appendChild(
+        actionRow.appendChild(
           addButton("+ Child field", () => {
             node.children.push(newNode("New field", "string"));
             rerender();
           })
         );
       }
-      actions.appendChild(
+      actionRow.appendChild(
         addButton(
           "Delete",
           () => {
@@ -170,10 +218,11 @@ export function openSchemaEditor({ projectId, schemaInfo, onSaved }) {
           true
         )
       );
-      row.appendChild(actions);
+      row.appendChild(actionRow);
     }
 
     wrap.appendChild(row);
+    renderRules(wrap, node);
 
     if (node.type === "object") {
       for (const child of node.children || []) {
@@ -240,6 +289,10 @@ export function openSchemaEditor({ projectId, schemaInfo, onSaved }) {
   const save = mk("button", "btn primary");
   save.textContent = "Save";
   save.addEventListener("click", async () => {
+    if (ruleErrors.size) {
+      message.textContent = `Invalid rules: ${[...ruleErrors.values()].join(" · ")}`;
+      return;
+    }
     save.disabled = true;
     message.textContent = "";
     try {

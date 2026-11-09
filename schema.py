@@ -11,12 +11,16 @@
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
 import jsonio
+import locks
+
+MAX_ARRAY_INDEX = 10000  # 防止 field_path 里的超大下标撑爆内存
 
 FIELD_TYPES = ("string", "number", "boolean", "object", "array")
 SCALAR_TYPES = ("string", "number", "boolean")
@@ -44,6 +48,28 @@ def new_id(prefix: str = "fld") -> str:
 # 构造与校验
 # --------------------------------------------------------------------------
 
+def normalize_validation(raw: Any) -> list[dict]:
+    """规则原样保留（只接受标量值），具体语义与合法性由 validation.py 负责。"""
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for rule in raw:
+        if not isinstance(rule, dict):
+            continue
+        clean = {
+            str(key): value
+            for key, value in rule.items()
+            if value is None or isinstance(value, (str, int, float, bool))
+        }
+        if clean.get("type"):
+            out.append(clean)
+        if len(out) >= 50:
+            break
+    return out
+
+
 def make_field(
     label: str,
     ftype: str = "string",
@@ -58,6 +84,7 @@ def make_field(
         "required": required,
         "description": description,
         "enum": [str(x) for x in (enum or [])],
+        "validation": [],
     }
     if ftype == "object":
         node["children"] = []
@@ -83,6 +110,7 @@ def normalize_node(node: dict) -> dict:
         "required": bool(node.get("required", False)),
         "description": str(node.get("description") or ""),
         "enum": [str(x) for x in (node.get("enum") or [])],
+        "validation": normalize_validation(node.get("validation")),
     }
     if ftype == "object":
         out["children"] = [normalize_node(c) for c in (node.get("children") or [])]
@@ -165,28 +193,31 @@ def load_schema_version(project_root: Path, version: int) -> dict | None:
 
 
 def save_schema(project_root: Path, new_schema: dict, expected_version: int | None = None) -> dict:
-    current = load_schema(project_root)
-    if expected_version is not None and int(expected_version) != current["version"]:
-        raise SchemaVersionConflict(current["version"])
+    # 版本检查、快照写入、指针更新必须是一次原子操作。没有这把锁时，两个并发
+    # PUT /schema 都会读到同一个 version 并通过检查，然后各自写 v{N+1} 覆盖对方。
+    with locks.project_lock(project_root):
+        current = load_schema(project_root)
+        if expected_version is not None and int(expected_version) != current["version"]:
+            raise SchemaVersionConflict(current["version"])
 
-    node = normalize_schema(new_schema)
-    validate_schema(node)
+        node = normalize_schema(new_schema)
+        validate_schema(node)
 
-    version = current["version"] + 1
-    jsonio.write_json(
-        project_root / "schemas" / f"v{version}.json",
-        {"version": version, "created_at": now_iso(), "schema": node},
-    )
-    jsonio.write_json(
-        project_root / "schema.json",
-        {"version": version, "updated_at": now_iso(), "schema": node},
-    )
-    return {
-        "version": version,
-        "schema": node,
-        "previous": current["schema"],
-        "previous_version": current["version"],
-    }
+        version = current["version"] + 1
+        jsonio.write_json(
+            project_root / "schemas" / f"v{version}.json",
+            {"version": version, "created_at": now_iso(), "schema": node},
+        )
+        jsonio.write_json(
+            project_root / "schema.json",
+            {"version": version, "updated_at": now_iso(), "schema": node},
+        )
+        return {
+            "version": version,
+            "schema": node,
+            "previous": current["schema"],
+            "previous_version": current["version"],
+        }
 
 
 # --------------------------------------------------------------------------
@@ -356,9 +387,13 @@ def parse_path(path: str) -> list[Any]:
             if j == -1:
                 raise SchemaError(f"Invalid field path: {path}")
             try:
-                segs.append(int(path[i + 1 : j]))
+                index = int(path[i + 1 : j])
             except ValueError:
                 raise SchemaError(f"Invalid array index: {path}")
+            # 负下标会命中 Python 列表尾部，必须拒绝，否则导入 / 回退会静默改错元素。
+            if index < 0 or index > MAX_ARRAY_INDEX:
+                raise SchemaError(f"Invalid array index: {path}")
+            segs.append(index)
             i = j + 1
             continue
         buf.append(ch)
@@ -394,7 +429,7 @@ def get_value(values: Any, segs: list[Any]) -> Any:
     cur = values
     for seg in segs:
         if isinstance(seg, int):
-            if not isinstance(cur, list) or seg >= len(cur):
+            if not isinstance(cur, list) or seg < 0 or seg >= len(cur):
                 return None
             cur = cur[seg]
         else:
@@ -602,6 +637,8 @@ def coerce_value(node: dict, raw: Any) -> tuple[bool, Any, str | None]:
             num = float(text)
         except ValueError:
             return False, None, f"\"{raw}\" is not a number"
+        if not math.isfinite(num):
+            return False, None, f"\"{raw}\" is not a finite number"
         return True, int(num) if num.is_integer() else num, None
     if t == "boolean":
         text = str(raw).strip().lower()

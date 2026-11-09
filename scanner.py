@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -40,12 +41,17 @@ def collect(images_dir: Path) -> dict:
     if not root.is_dir():
         raise FileNotFoundError(f"Image directory not found: {root}")
 
+    # 只走目录、只收图片：几万个图片的目录也能在一两秒内扫完。
+    # 不再对每个文件 Image.open（那才是几万文件时卡住的原因），只有 TIFF
+    # 需要额外读一次页数，其余格式在浏览器里按需加载。
     found: list[tuple[str, Path]] = []
-    for path in sorted(root.rglob("*"), key=lambda p: p.as_posix().lower()):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() in IMAGE_EXTS:
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if Path(name).suffix.lower() not in IMAGE_EXTS:
+                continue
+            path = Path(dirpath) / name
             found.append((path.relative_to(root).as_posix(), path))
+    found.sort(key=lambda item: item[0].lower())
 
     by_id: dict[str, list[str]] = {}
     for rel, _ in found:
@@ -59,10 +65,11 @@ def collect(images_dir: Path) -> dict:
     for rel, path in found:
         try:
             stat = path.stat()
-            with Image.open(path) as im:
-                frames = int(getattr(im, "n_frames", 1) or 1)
-                size = list(im.size)
-        except Exception as exc:  # 解码器缺失或文件损坏
+            frames = 1
+            if path.suffix.lower() in (".tif", ".tiff"):
+                with Image.open(path) as im:
+                    frames = int(getattr(im, "n_frames", 1) or 1)
+        except Exception as exc:  # 权限、损坏文件等：跳过并记录
             unsupported.append({"source": rel, "error": f"{type(exc).__name__}: {exc}"})
             continue
         warning = None
@@ -76,7 +83,6 @@ def collect(images_dir: Path) -> dict:
                 "warning": warning,
                 "size_bytes": stat.st_size,
                 "mtime_ns": stat.st_mtime_ns,
-                "pixel_size": size,
             }
         )
 
@@ -90,8 +96,8 @@ def collect(images_dir: Path) -> dict:
     }
 
 
-def scan(project) -> dict:
-    index = collect(project.images_dir())
+def scan(project, index: dict | None = None) -> dict:
+    index = index if index is not None else collect(project.images_dir())
     jsonio.write_json(project.root / "cases_index.json", index)
     return index
 
