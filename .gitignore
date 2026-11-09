@@ -13,3 +13,4 @@ env/
 
 # editor artifacts
 /.trae-html-share-packages/
+/.workbuddy/
