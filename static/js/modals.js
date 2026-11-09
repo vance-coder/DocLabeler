@@ -111,6 +111,8 @@ const STAT_LABELS = {
   rows: "Rows",
   cases: "Matched cases",
   applied_fields: "Fields written",
+  kept_values: "Values kept",
+  confidence: "Confidence values",
   notes: "Notes written",
   skipped_fill: "Skipped (existing value)",
   unknown_case: "Unknown case",
@@ -140,7 +142,20 @@ export function openImportModal({ projectId, onDone }) {
   mode.innerHTML = `
     <option value="overwrite">Overwrite current values</option>
     <option value="fill_empty">Fill empty fields only</option>
+    <option value="baseline">Update baseline only (keep my edits)</option>
   `;
+
+  const modeHelp = mk("div", "help");
+  const syncModeHelp = () => {
+    modeHelp.textContent =
+      mode.value === "baseline"
+        ? "New predictions become the comparison baseline. Current values and notes stay untouched, and the right panel shows you where the new predictions differ from your edits."
+        : mode.value === "fill_empty"
+        ? "Only empty fields are filled. Every imported value still becomes the baseline for comparison."
+        : "All imported values replace the current ones. The previous values are kept as the baseline.";
+  };
+  mode.addEventListener("change", syncModeHelp);
+  syncModeHelp();
 
   const fileInput = mk("input");
   fileInput.type = "file";
@@ -156,13 +171,14 @@ export function openImportModal({ projectId, onDone }) {
 
   const help = mk("div", "help");
   help.innerHTML =
-    "Long-format columns: <span class='mono'>case_id, field_path, value, note</span>; field_path looks like <span class='mono'>items[0].amount</span>.";
+    "Long-format columns: <span class='mono'>case_id, field_path, value, note</span>; optional <span class='mono'>confidence</span> (0-1 or 0-100) flags low-confidence fields. field_path looks like <span class='mono'>items[0].amount</span>.";
 
   const result = mk("div");
   result.style.marginTop = "14px";
 
   modal.body.appendChild(fieldRow("File type", kind));
   modal.body.appendChild(fieldRow("Import mode", mode));
+  modal.body.appendChild(modeHelp);
   modal.body.appendChild(fieldRow("Files", fileInput));
   modal.body.appendChild(help);
   modal.body.appendChild(result);
@@ -315,68 +331,4 @@ export function openExportModal({
 
   modal.foot.appendChild(cancel);
   modal.foot.appendChild(submit);
-}
-
-// ---------------------------------------------------------------------------
-// Collection name
-// ---------------------------------------------------------------------------
-export function openCollectionNameModal({
-  title = "New collection",
-  submitLabel = "Create collection",
-  onConfirm,
-}) {
-  const modal = openModal({ title });
-
-  const name = textInput("e.g. Invoice batch 1");
-  const message = mk("div", "schema-msg");
-  modal.body.appendChild(
-    fieldRow(
-      "Collection name",
-      name,
-      "Short and readable. Slashes and “..” are not allowed."
-    )
-  );
-  modal.body.appendChild(message);
-
-  const cancel = mk("button", "btn");
-  cancel.textContent = "Cancel";
-  cancel.addEventListener("click", () => modal.close());
-
-  const submit = mk("button", "btn primary");
-  submit.textContent = submitLabel;
-
-  const confirm = async () => {
-    const value = name.value.trim();
-    message.textContent = "";
-    if (!value) {
-      message.textContent = "Enter a collection name.";
-      name.focus();
-      return;
-    }
-    if (/[\\/]|\.\./.test(value)) {
-      message.textContent = "Name cannot contain /, \\ or ..";
-      name.focus();
-      return;
-    }
-    submit.disabled = true;
-    try {
-      await onConfirm(value);
-      modal.close();
-    } catch (error) {
-      message.textContent = error.message;
-    } finally {
-      submit.disabled = false;
-    }
-  };
-
-  submit.addEventListener("click", confirm);
-  name.addEventListener("keydown", (event) => {
-    if (event.key !== "Enter") return;
-    event.preventDefault();
-    confirm();
-  });
-
-  modal.foot.appendChild(cancel);
-  modal.foot.appendChild(submit);
-  name.focus();
 }

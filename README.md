@@ -41,7 +41,7 @@ python app.py --workspace D:\data\doclabeler
       .baseline/<import_id>/   # 导入快照（不可变），含 cases/*.json、meta.json、report.json
       imports/index.json
       imports/reports/<import_id>.json
-      collections/          # 手动合集
+      collections/          # 旧版手动合集，首次加载时迁移为标签并归档为 *.migrated
       exports/<version>/
       .cache/preview/       # 预览 PNG 缓存
 ```
@@ -121,12 +121,15 @@ python app.py --workspace D:\data\doclabeler
 - CSV / Excel 长表，列固定为：
 
 ```csv
-case_id,field_path,value,note
-2024_10_14_A_001,doc_no,A-001,
-2024_10_14_A_001,total,3040,合计与明细一致
-2024_10_14_A_001,items[0].description,CT Brain,
-2024_10_14_A_001,items[0].amount,3040,
+case_id,field_path,value,note,confidence
+2024_10_14_A_001,doc_no,A-001,,0.98
+2024_10_14_A_001,total,3040,合计与明细一致,0.74
+2024_10_14_A_001,items[0].description,CT Brain,,
+2024_10_14_A_001,items[0].amount,3040,,
 ```
+
+`confidence` 可选，接受 0-1 或 0-100；低于 0.8 的字段会在表单和列表中标记，
+用于优先复核低置信度结果。JSON 导入可在每个 case 里带 `"confidence": {"doc_no": 0.9}`。
 
 导入规则：
 
@@ -142,15 +145,26 @@ case_id,field_path,value,note
 - `value` 按 schema 类型转换；数字、布尔、枚举不符会写入报告并跳过该字段，不会写入脏数据。
 - 缺失 case、缺失字段、类型不符都记录在 `imports/reports/<import_id>.json`，不静默丢弃。
 - 每次导入生成 `.baseline/<import_id>/` 快照，annotation 里记录 `baseline_import_id`。
-- 导入模式：`overwrite`（覆盖）或 `fill_empty`（只填空字段）。
+- 导入模式：`overwrite`（覆盖）、`fill_empty`（只填空字段）或 `baseline`（只更新 baseline）。
+- `baseline` 用于 LLM 换 prompt 后重新跑的结果：新预测只写入 baseline，当前值与备注保持
+  人工修正后的内容，右侧差异会直接显示「新预测 vs 人工值」。
 - `fill_empty` 跳过的字段仍会写入 baseline，因此之后修改该字段时依然能和导入值做差异对比。
 
 ## 差异高亮
 
 - 当前值与 baseline 逐字段比较，区分新增 / 修改 / 删除；表单补齐的空值不计为「新增」。
 - 修改字段显示原值，并提供单字段「回退」。
-- 列表过滤：全部 / 已改 / 未标 / 已完成 / 有备注。
+- 列表过滤：全部 / 已改 / 未标 / 低置信度 / 已完成 / 有备注；低置信度按最差分数升序排列。
 - 已知边界：数组按索引比较，`items` 中间插入一项会让后续项都显示为修改。
+
+## 搜索与修正回流
+
+- 搜索除 case_id 与路径外，还覆盖所有字段值和字段备注；命中字段会显示在列表项下方，
+  点击可直接跳到该字段。
+- `GET /api/projects/<id>/search-index` 返回每个 case 的可搜索文本，前端打开项目后后台加载。
+- `GET /api/projects/<id>/corrections.csv` 按字段聚合「baseline(模型) vs 当前(人工)」的修改与
+  删除，附出现次数、样例 case 与备注，可直接用于 few-shot 或修改 prompt。界面入口在
+  Notes & prompt 弹窗底部。
 
 ## 导出
 
@@ -181,10 +195,11 @@ case_id, source, source_abs, exported_image, sha256, exported_sha256, schema_ver
 界面文案为英文，样式基于本地引入的 Bootstrap 5.3.3 与 Bootstrap Icons（见
 `static/vendor/`，不依赖 CDN，离线可用）。
 
-- 左：目录分组的图片列表、过滤、多选。
-- 中：图片查看器，滚轮缩放、拖拽平移、旋转、适应窗口；`←` / `→` 切换 case。
-- 右：schema 表单、字段备注、差异提示；顶部状态与标签。
+- 左：目录分组的图片列表、全局搜索（case / 路径 / 字段值 / 备注）、过滤、标签筛选、多选与批量操作。
+- 中：图片查看器，滚轮以鼠标位置缩放、拖拽平移、旋转、适应窗口；`←` / `→` 切换 case；`p` 演示当前列表。
+- 右：schema 表单、字段备注、差异提示；顶部状态与标签；低于 80% 置信度的字段带百分比标记。
 - 底：只读原始 JSON。
+- 快捷键：`Space` 直接把当前 case 标记为 Done 并跳到下一张，`Ctrl+S` 保存，`?` 查看全部。
 
 ## 测试
 
@@ -194,12 +209,18 @@ python -m pytest tests -q
 
 覆盖：case_id 生成与冲突、case_id 片段匹配与歧义取首张、CSV 长表导入与类型校验、
 导出 manifest 完整性、label 改名后的标注迁移、API 主流程与乐观锁、批量操作、
-revert all、合集 CRUD、备注聚合与冲突判定、prompt 草稿。
+revert all、旧合集迁移为标签、备注聚合与冲突判定、prompt 草稿、baseline-only 导入、
+全局搜索索引、置信度标记与 corrections.csv。
 
 ## 当前范围
 
 已实现：多项目、扫描、schema 三种来源与版本快照、标注与自动保存、导入与 baseline、
-差异高亮与单字段/整体回退、导出（JSON / 宽表 CSV / manifest）、批量状态与标签、
-手动合集与展示模式、备注聚合（冲突标记）与 prompt 草稿、字段级 undo/redo。
+差异高亮与单字段/整体回退、置信度标记与低置信度过滤、baseline-only 重跑导入、
+导出（JSON / 宽表 CSV / manifest / corrections.csv）、批量状态与标签、
+标签筛选与演示模式、备注聚合（冲突标记）与 prompt 草稿、字段级 undo/redo、
+全局搜索（case / 路径 / 字段值 / 备注）。
 界面提供进度与下一张未标注、搜索与过滤计数、缩略图条、分栏拖拽、快捷键帮助、
-全局保存状态与冲突处理。
+全局保存状态与冲突处理、`Space` 快速复核并前进。
+
+旧版「合集」已合并进标签：打开项目时会把 `collections/*.json` 里的每个合集转成同名
+标签，原文件归档为 `collections/*.json.migrated`，不再显示。

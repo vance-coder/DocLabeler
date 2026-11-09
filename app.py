@@ -10,7 +10,6 @@ import re
 import webbrowser
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -26,10 +25,28 @@ import projects
 import scanner
 import schema
 import store
-from paths import is_safe_id, resolve_images_dir, safe_filename
+from paths import is_safe_id, resolve_images_dir
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+LOW_CONFIDENCE = 0.8
+
+
+def _template_path(path: str) -> str:
+    """把 ``items[0].amount`` 归一成 schema 里的 ``items[].amount``。"""
+    return re.sub(r"\[\d+\]", "[]", str(path or ""))
+
+
+def _field_labels(schema_root: dict) -> dict[str, str]:
+    return {path: node["label"] for path, node in schema.iter_fields(schema_root)}
+
+
+def _csv_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
 
 
 # --------------------------------------------------------------------------
@@ -196,17 +213,45 @@ def _prompt_payload(project, schema_info: dict) -> dict:
     return {"text": "\n".join(lines).strip() + "\n", "sections": sections}
 
 
-def _collection_path(project, name: str) -> Path:
-    return project.root / "collections" / f"{safe_filename(name, max_len=60)}.json"
+def _migrate_collections(project, index: dict, info: dict) -> int:
+    """把旧的 collections/*.json 转成同名标签，并把原文件归档为 *.migrated。"""
+    directory = project.root / "collections"
+    if not directory.is_dir():
+        return 0
+    marker = directory / ".tags-migrated"
+    if marker.exists():
+        return 0
+    files = sorted(path for path in directory.glob("*.json") if path.is_file())
+    if not files:
+        return 0
 
-
-def _check_collection_name(name: str) -> str:
-    name = unquote(str(name or "")).strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Collection name cannot be empty")
-    if "/" in name or "\\" in name or ".." in name:
-        raise HTTPException(status_code=400, detail="Invalid collection name")
-    return name
+    cases = {case["case_id"]: case for case in index.get("cases", [])}
+    migrated = 0
+    for path in files:
+        data = jsonio.read_json(path)
+        if not isinstance(data, dict):
+            continue
+        name = str(data.get("name") or path.stem).strip()
+        if name:
+            for raw in data.get("case_ids") or []:
+                case = cases.get(str(raw))
+                if case is None:
+                    continue
+                annotation = store.load_annotation(project, case["case_id"])
+                if annotation is None:
+                    annotation = store.make_annotation(project, case, info)
+                tags = [str(tag) for tag in (annotation.get("tags") or [])]
+                if name in tags:
+                    continue
+                tags.append(name)
+                annotation["tags"] = tags
+                annotation["rev"] = int(annotation.get("rev") or 0) + 1
+                annotation["updated_at"] = schema.now_iso()
+                jsonio.write_json(store.annotation_path(project, case["case_id"]), annotation)
+                migrated += 1
+        path.rename(path.with_name(path.name + ".migrated"))
+    marker.write_text(schema.now_iso() + "\n", encoding="utf-8")
+    return migrated
 
 
 def create_app(workspace: Path) -> FastAPI:
@@ -360,6 +405,7 @@ def create_app(workspace: Path) -> FastAPI:
         project = _project(project_id)
         index = scanner.scan(project) if refresh else _index(project)
         info = _schema_info(project)
+        _migrate_collections(project, index, info)
         annotations = store.list_annotations(project)
 
         rows = []
@@ -375,6 +421,12 @@ def create_app(workspace: Path) -> FastAPI:
             ann = annotations.get(case["case_id"])
             if ann:
                 diff = diffing.diff_for_case(project, ann, info)
+                confidence = ann.get("confidence")
+                scores = (
+                    [float(value) for value in confidence.values()]
+                    if isinstance(confidence, dict)
+                    else []
+                )
                 entry["annotation"] = {
                     "status": ann.get("status") or "draft",
                     "tags": ann.get("tags") or [],
@@ -384,6 +436,10 @@ def create_app(workspace: Path) -> FastAPI:
                     ),
                     "has_baseline": diff["has_baseline"],
                     "diff_count": len(diff["fields"]),
+                    "confidence_min": min(scores) if scores else None,
+                    "low_confidence": len(
+                        [score for score in scores if score < LOW_CONFIDENCE]
+                    ),
                 }
             rows.append(entry)
         return {
@@ -391,6 +447,46 @@ def create_app(workspace: Path) -> FastAPI:
             "index": _index_summary(index),
             "schema_version": info["version"],
         }
+
+    @app.get("/api/projects/{project_id}/search-index")
+    def api_search_index(project_id: str) -> dict:
+        """返回每个 case 的可搜索字段值与备注，供前端做全局搜索。"""
+        project = _project(project_id)
+        info = _schema_info(project)
+        labels = _field_labels(info["schema"])
+        entries: dict[str, list[dict]] = {}
+        for case_id, ann in store.list_annotations(project).items():
+            items: list[dict] = []
+            for path, raw in schema.flatten_json(ann.get("values") or {}).items():
+                if raw is None or isinstance(raw, (dict, list)):
+                    continue
+                text = str(raw)
+                if not text.strip():
+                    continue
+                items.append(
+                    {
+                        "path": path,
+                        "label": labels.get(_template_path(path), ""),
+                        "kind": "value",
+                        "text": text,
+                    }
+                )
+            notes = ann.get("notes")
+            if isinstance(notes, dict):
+                for path, raw in notes.items():
+                    text = str(raw or "")
+                    if not text.strip():
+                        continue
+                    items.append(
+                        {
+                            "path": str(path),
+                            "label": labels.get(_template_path(str(path)), ""),
+                            "kind": "note",
+                            "text": text,
+                        }
+                    )
+            entries[case_id] = items
+        return {"cases": entries}
 
     # ------------------------------------------------------------------
     # 预览
@@ -668,92 +764,6 @@ def create_app(workspace: Path) -> FastAPI:
         return {"annotation": saved, "reverted": reverted, "missing": missing}
 
     # ------------------------------------------------------------------
-    # Collections
-    # ------------------------------------------------------------------
-    @app.get("/api/projects/{project_id}/collections")
-    def api_list_collections(project_id: str) -> dict:
-        project = _project(project_id)
-        directory = project.root / "collections"
-        items: list[dict] = []
-        if directory.exists():
-            for path in directory.glob("*.json"):
-                data = jsonio.read_json(path)
-                if not isinstance(data, dict):
-                    continue
-                items.append(
-                    {
-                        "name": data.get("name") or path.stem,
-                        "count": len(data.get("case_ids") or []),
-                        "updated_at": data.get("updated_at"),
-                    }
-                )
-        items.sort(key=lambda item: str(item["name"]))
-        return {"collections": items}
-
-    @app.get("/api/projects/{project_id}/collections/{name}")
-    def api_get_collection(project_id: str, name: str) -> dict:
-        project = _project(project_id)
-        name = _check_collection_name(name)
-        data = jsonio.read_json(_collection_path(project, name))
-        if not isinstance(data, dict):
-            raise HTTPException(status_code=404, detail="Collection not found")
-        return {
-            "name": data.get("name") or name,
-            "case_ids": list(data.get("case_ids") or []),
-            "updated_at": data.get("updated_at"),
-        }
-
-    @app.put("/api/projects/{project_id}/collections/{name}")
-    def api_put_collection(project_id: str, name: str, payload: dict) -> dict:
-        project = _project(project_id)
-        name = _check_collection_name(name)
-        index = _index(project)
-
-        raw_ids = payload.get("case_ids")
-        if not isinstance(raw_ids, list):
-            raise HTTPException(status_code=400, detail="case_ids must be an array")
-        case_ids: list[str] = []
-        for raw in raw_ids:
-            case_id = str(raw)
-            if case_id and case_id not in case_ids:
-                case_ids.append(case_id)
-
-        known = set(scanner.index_map(index))
-        unknown = [case_id for case_id in case_ids if case_id not in known]
-        if unknown:
-            raise HTTPException(
-                status_code=400,
-                detail={"message": "Unknown case IDs", "unknown": unknown},
-            )
-
-        path = _collection_path(project, name)
-        existing = jsonio.read_json(path)
-        now = schema.now_iso()
-        created_at = (
-            existing.get("created_at")
-            if isinstance(existing, dict) and existing.get("created_at")
-            else now
-        )
-        record = {
-            "name": name,
-            "case_ids": case_ids,
-            "created_at": created_at,
-            "updated_at": now,
-        }
-        jsonio.write_json(path, record)
-        return {"name": name, "case_ids": case_ids, "updated_at": now}
-
-    @app.delete("/api/projects/{project_id}/collections/{name}")
-    def api_delete_collection(project_id: str, name: str) -> dict:
-        project = _project(project_id)
-        name = _check_collection_name(name)
-        path = _collection_path(project, name)
-        if not path.exists():
-            raise HTTPException(status_code=404, detail="Collection not found")
-        path.unlink()
-        return {"deleted": True}
-
-    # ------------------------------------------------------------------
     # 备注聚合 / Prompt 草稿
     # ------------------------------------------------------------------
     @app.get("/api/projects/{project_id}/notes/summary")
@@ -775,6 +785,79 @@ def create_app(workspace: Path) -> FastAPI:
     def api_prompt(project_id: str) -> dict:
         project = _project(project_id)
         return _prompt_payload(project, _schema_info(project))
+
+    @app.get("/api/projects/{project_id}/corrections.csv")
+    def api_corrections_csv(project_id: str):
+        """按字段聚合「baseline(模型) vs 当前(人工)」的差异，用于回流提示词。"""
+        project = _project(project_id)
+        info = _schema_info(project)
+        labels = _field_labels(info["schema"])
+
+        buckets: dict[tuple, dict] = {}
+        for case_id, ann in sorted(store.list_annotations(project).items()):
+            diff = diffing.diff_for_case(project, ann, info)
+            if not diff["has_baseline"]:
+                continue
+            notes = ann.get("notes") or {}
+            for field in diff["fields"]:
+                if field["kind"] == "added":
+                    # 当前值存在但本次 baseline 没有预测，通常不是模型错误，跳过
+                    continue
+                path = _template_path(field["path"])
+                key = (
+                    path,
+                    field["kind"],
+                    _csv_cell(field["old"]),
+                    _csv_cell(field["new"]),
+                )
+                bucket = buckets.setdefault(
+                    key,
+                    {
+                        "path": path,
+                        "kind": field["kind"],
+                        "old": field["old"],
+                        "new": field["new"],
+                        "cases": [],
+                        "notes": [],
+                    },
+                )
+                bucket["cases"].append(case_id)
+                note = str(notes.get(field["path"]) or "").strip()
+                if note and note not in bucket["notes"]:
+                    bucket["notes"].append(note)
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(
+            [
+                "field_path",
+                "label",
+                "kind",
+                "baseline_value",
+                "current_value",
+                "count",
+                "case_ids",
+                "notes",
+            ]
+        )
+        for bucket in sorted(buckets.values(), key=lambda item: (-len(item["cases"]), item["path"])):
+            writer.writerow(
+                [
+                    bucket["path"],
+                    labels.get(bucket["path"], ""),
+                    bucket["kind"],
+                    _csv_cell(bucket["old"]),
+                    _csv_cell(bucket["new"]),
+                    len(bucket["cases"]),
+                    ";".join(sorted(bucket["cases"])[:20]),
+                    " | ".join(bucket["notes"][:3]),
+                ]
+            )
+        return Response(
+            content="\ufeff" + buffer.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="corrections.csv"'},
+        )
 
     # ------------------------------------------------------------------
     # 导入

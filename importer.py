@@ -28,6 +28,12 @@ HEADER_ALIASES = {
     "字段路径": "field_path",
     "值": "value",
     "备注": "note",
+    "score": "confidence",
+    "prob": "confidence",
+    "probability": "confidence",
+    "conf": "confidence",
+    "置信度": "confidence",
+    "置信分数": "confidence",
 }
 
 
@@ -133,8 +139,20 @@ def parse_json_case(filename: str, data: bytes) -> dict:
     case_id = payload.get("case_id") or payload.get("id")
     values = payload.get("values") if isinstance(payload.get("values"), dict) else None
     notes = payload.get("notes")
+    confidence = payload.get("confidence") if isinstance(payload.get("confidence"), dict) else {}
     if values is None:
-        reserved = {"case_id", "id", "source", "schema_version", "status", "tags", "notes", "rev", "updated_at"}
+        reserved = {
+            "case_id",
+            "id",
+            "source",
+            "schema_version",
+            "status",
+            "tags",
+            "notes",
+            "confidence",
+            "rev",
+            "updated_at",
+        }
         values = {k: v for k, v in payload.items() if k not in reserved}
         notes = notes if notes is not None else payload.get("notes")
     return {
@@ -142,11 +160,28 @@ def parse_json_case(filename: str, data: bytes) -> dict:
         "filename_stem": Path(filename).stem,
         "values": schema.flatten_json(values or {}),
         "notes": _flatten_notes(notes),
+        "confidence": schema.flatten_json(confidence),
     }
 
 
 def _is_empty(value: Any) -> bool:
     return value is None or value == "" or value == [] or value == {}
+
+
+def _parse_confidence(raw: Any) -> float | None:
+    """接受 0-1 或 0-100 的置信度，统一成 0-1；无法解析时返回 None。"""
+    if raw is None:
+        return None
+    text = str(raw).strip().rstrip("%")
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    if value > 1:
+        value = value / 100 if value <= 100 else 1.0
+    return max(0.0, min(1.0, value))
 
 
 def run_import(
@@ -158,8 +193,8 @@ def run_import(
     mode: str = "overwrite",
 ) -> dict:
     """uploads: [{"filename": str, "data": bytes}]。"""
-    if mode not in ("overwrite", "fill_empty"):
-        raise ImportFailed("Import mode must be overwrite or fill_empty")
+    if mode not in ("overwrite", "fill_empty", "baseline"):
+        raise ImportFailed("Import mode must be overwrite, fill_empty, or baseline")
     if kind not in ("csv", "excel", "json"):
         raise ImportFailed("Import kind must be csv, excel, or json")
 
@@ -178,6 +213,8 @@ def run_import(
         "rows": 0,
         "cases": 0,
         "applied_fields": 0,
+        "kept_values": 0,
+        "confidence": 0,
         "notes": 0,
         "skipped_fill": 0,
         "unknown_case": 0,
@@ -269,7 +306,8 @@ def run_import(
 
     def add_group(case_id: str) -> dict:
         return grouped.setdefault(
-            case_id, {"values": [], "notes": [], "baseline": {}, "baseline_notes": {}}
+            case_id,
+            {"values": [], "notes": [], "confidence": {}, "baseline": {}, "baseline_notes": {}},
         )
 
     # ---------- 解析为按 case 分组 ----------
@@ -300,6 +338,8 @@ def run_import(
             group = add_group(case_id)
             for path, value in parsed["values"].items():
                 group["values"].append({"case_id": case_id, "field_path": path, "value": value, "line": None})
+            for path, conf in parsed["confidence"].items():
+                group["confidence"][path] = conf
             for path, note in parsed["notes"].items():
                 group["notes"].append({"case_id": case_id, "field_path": path, "note": note})
             continue
@@ -345,6 +385,9 @@ def run_import(
                     "line": row.get("_line"),
                 }
             )
+            confidence = str(row.get("confidence") or "").strip()
+            if confidence:
+                group["confidence"][str(row.get("field_path") or "").strip()] = confidence
             note = str(row.get("note") or "")
             if note.strip():
                 group["notes"].append(
@@ -366,6 +409,12 @@ def run_import(
         )
         values = ann.get("values") if isinstance(ann.get("values"), dict) else {}
         notes = dict(ann.get("notes") or {})
+        confidence = (
+            dict(ann.get("confidence") or {})
+            if isinstance(ann.get("confidence"), dict)
+            else {}
+        )
+        baseline_confidence: dict[str, float] = {}
 
         for item in group["values"]:
             path = item["field_path"]
@@ -424,6 +473,15 @@ def run_import(
                 continue
             # baseline 始终记录导入值，作为差异比较的参照（即使 fill_empty 未写入当前标注）
             schema.set_value(group["baseline"], segs, value)
+            parsed_confidence = _parse_confidence(group["confidence"].get(path))
+            if parsed_confidence is not None:
+                confidence[path] = parsed_confidence
+                baseline_confidence[path] = parsed_confidence
+                stats["confidence"] += 1
+            if mode == "baseline":
+                # 只刷新 baseline，保留人工修正后的当前值与备注
+                stats["kept_values"] += 1
+                continue
             if mode == "fill_empty" and not _is_empty(schema.get_value(values, segs)):
                 stats["skipped_fill"] += 1
                 continue
@@ -440,8 +498,10 @@ def run_import(
                 continue
             if schema.find_node(root, segs) is None:
                 continue
-            notes[path] = item["note"]
             group["baseline_notes"][path] = item["note"]
+            if mode == "baseline":
+                continue
+            notes[path] = item["note"]
             stats["notes"] += 1
 
         if _is_empty(group["baseline"]) and not group["baseline_notes"]:
@@ -453,6 +513,7 @@ def run_import(
             {
                 "values": values,
                 "notes": notes,
+                "confidence": confidence,
                 "status": ann.get("status") or "draft",
                 "tags": ann.get("tags") or [],
                 "baseline_import_id": import_id,
@@ -471,6 +532,7 @@ def run_import(
                 "imported_at": schema.now_iso(),
                 "values": group["baseline"],
                 "notes": group["baseline_notes"],
+                "confidence": baseline_confidence,
             },
         )
         touched.append(case_id)

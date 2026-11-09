@@ -53,6 +53,7 @@ def make_annotation(project, case: dict, schema_info: dict) -> dict:
         "schema_version": schema_info["version"],
         "values": schema.default_value(schema_info["schema"]),
         "notes": {},
+        "confidence": {},
         "status": "draft",
         "tags": [],
         "baseline_import_id": None,
@@ -95,6 +96,17 @@ def _normalize_payload(payload: dict, current: dict | None) -> dict:
     status = payload.get("status") or "draft"
     if status not in STATUSES:
         raise AnnotationError(f"Invalid status: {status}")
+    confidence_in = payload.get(
+        "confidence", (current or {}).get("confidence")
+    )
+    confidence: dict[str, float] = {}
+    if isinstance(confidence_in, dict):
+        for path, raw in confidence_in.items():
+            try:
+                number = float(raw)
+            except (TypeError, ValueError):
+                continue
+            confidence[str(path)] = max(0.0, min(1.0, number))
     tags_in = payload.get("tags") or []
     if isinstance(tags_in, str):
         tags_in = [t for t in re.split(r"[,，\s]+", tags_in) if t]
@@ -103,6 +115,7 @@ def _normalize_payload(payload: dict, current: dict | None) -> dict:
     return {
         "values": values,
         "notes": notes,
+        "confidence": confidence,
         "status": status,
         "tags": [str(t).strip() for t in tags_in if str(t).strip()],
         "baseline_import_id": payload.get(
@@ -131,6 +144,7 @@ def save_annotation(
             "schema_version": schema_info["version"],
             "values": clean["values"],
             "notes": clean["notes"],
+            "confidence": clean["confidence"],
             "status": clean["status"],
             "tags": clean["tags"],
             "baseline_import_id": clean["baseline_import_id"],

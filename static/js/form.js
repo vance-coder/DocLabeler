@@ -9,6 +9,7 @@ const TYPE_LABELS = {
 };
 
 const KIND_LABELS = { added: "Added", modified: "Modified", removed: "Removed" };
+const LOW_CONFIDENCE = 0.8;
 
 // ---------------------------------------------------------------------------
 // Field note popover (single instance, appended to body to avoid clipping)
@@ -182,6 +183,12 @@ function makeFieldRow(node, path, ctx, options = {}) {
   row.className = "field";
   row.dataset.path = path;
   const note = ctx.notes ? ctx.notes[path] || "" : "";
+  const rawConfidence = ctx.confidence ? ctx.confidence[path] : undefined;
+  const confidence = typeof rawConfidence === "number" ? rawConfidence : null;
+  const confidenceHtml =
+    confidence !== null && confidence < LOW_CONFIDENCE
+      ? `<span class="conf-badge" title="Model confidence ${Math.round(confidence * 100)}% (below ${Math.round(LOW_CONFIDENCE * 100)}%)">${Math.round(confidence * 100)}%</span>`
+      : "";
 
   const head = document.createElement("div");
   head.className = "field-head";
@@ -190,6 +197,7 @@ function makeFieldRow(node, path, ctx, options = {}) {
     <span class="field-label">${escapeHtml(node.label || "item")}</span>
     ${node.required ? '<span class="req" title="Required">*</span>' : ""}
     <span class="type-tag">${TYPE_LABELS[node.type] || node.type}</span>
+    ${confidenceHtml}
     ${options.extraHead || ""}
     <button type="button" class="note-btn${String(note).trim() ? " has-note" : ""}" title="${String(note).trim() ? "Edit field note" : "Field note"}" aria-label="Field note for ${escapeHtml(node.label || "item")}" aria-haspopup="dialog"><i class="bi bi-sticky" aria-hidden="true"></i></button>
   `;

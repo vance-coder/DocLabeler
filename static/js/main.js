@@ -13,7 +13,6 @@ import { createViewer } from "./viewer.js";
 import { openSchemaEditor } from "./schema_editor.js";
 import { openModal } from "./modal.js";
 import {
-  openCollectionNameModal,
   openCreateProjectModal,
   openExportModal,
   openImportModal,
@@ -30,8 +29,6 @@ const PANES_KEY = "doclabeler.panes";
 const RIGHT_COLLAPSED_KEY = "doclabeler.rightCollapsed";
 const RAW_COLLAPSED_KEY = "doclabeler.rawCollapsed";
 const ONLY_CHANGED_KEY = "doclabeler.onlyChanged";
-const LEFT_TAB_KEY = "doclabeler.leftTab";
-const COLLECTION_KEY = "doclabeler.collection";
 
 const LEFT_MIN = 240;
 const LEFT_MAX = 560;
@@ -72,58 +69,6 @@ function writeFlag(key, value) {
   }
 }
 
-function readLeftTab() {
-  try {
-    return localStorage.getItem(LEFT_TAB_KEY) === "collections"
-      ? "collections"
-      : "images";
-  } catch (error) {
-    return "images";
-  }
-}
-
-function writeLeftTab(tab) {
-  try {
-    localStorage.setItem(LEFT_TAB_KEY, tab);
-  } catch (error) {
-    /* storage may be unavailable */
-  }
-}
-
-function readSavedCollection() {
-  try {
-    const raw = localStorage.getItem(COLLECTION_KEY);
-    if (!raw) return null;
-    const data = JSON.parse(raw);
-    if (!data || typeof data.name !== "string" || !data.name) return null;
-    return {
-      projectId: data.projectId || null,
-      name: data.name,
-    };
-  } catch (error) {
-    return null;
-  }
-}
-
-function writeSavedCollection(name) {
-  try {
-    localStorage.setItem(
-      COLLECTION_KEY,
-      JSON.stringify({ projectId: state.projectId, name })
-    );
-  } catch (error) {
-    /* storage may be unavailable */
-  }
-}
-
-function clearSavedCollection() {
-  try {
-    localStorage.removeItem(COLLECTION_KEY);
-  } catch (error) {
-    /* storage may be unavailable */
-  }
-}
-
 function readPanes() {
   let left = DEFAULT_PANES.left;
   let right = DEFAULT_PANES.right;
@@ -151,9 +96,12 @@ const FILTERS = [
   { key: "all", label: "All" },
   { key: "modified", label: "Modified" },
   { key: "unlabeled", label: "Unlabeled" },
+  { key: "low", label: "Low confidence" },
   { key: "done", label: "Done" },
   { key: "notes", label: "With notes" },
 ];
+
+const LOW_CONFIDENCE = 0.8;
 
 const state = {
   projects: [],
@@ -178,11 +126,8 @@ const state = {
   revertingAll: false,
   conflict: false,
   imageUrl: "",
-  leftTab: readLeftTab(),
-  collections: [],
-  collectionName: null,
-  collectionIds: [],
-  collectionBusy: false,
+  tagFilter: "",
+  searchIndex: null,
 };
 
 let viewer = null;
@@ -408,38 +353,6 @@ function redoEdit() {
   return true;
 }
 
-function resetCollectionView({ keepTab = false } = {}) {
-  state.collections = [];
-  state.collectionName = null;
-  state.collectionIds = [];
-  state.selected = new Set();
-  clearSavedCollection();
-  if (!keepTab) {
-    state.leftTab = "images";
-    writeLeftTab("images");
-  }
-}
-
-function collectionActive() {
-  return state.leftTab === "collections" && Boolean(state.collectionName);
-}
-
-function collectionCases() {
-  if (!state.collectionName) return [];
-  const ids = new Set(state.collectionIds);
-  return state.cases.filter((item) => ids.has(item.case_id));
-}
-
-function normalizeCollectionIds() {
-  if (!state.collectionName) return;
-  const known = new Set(state.cases.map((item) => item.case_id));
-  state.collectionIds = state.collectionIds.filter((id) => known.has(id));
-}
-
-function scopedCases() {
-  return collectionActive() ? collectionCases() : state.cases;
-}
-
 // ---------------------------------------------------------------------------
 // 路由
 // ---------------------------------------------------------------------------
@@ -468,7 +381,8 @@ async function renderProjects() {
   state.dirty = false;
   state.search = "";
   state.imageUrl = "";
-  resetCollectionView();
+  state.tagFilter = "";
+  state.selected = new Set();
   hideConflictBanner();
   topCenter.innerHTML = "";
   topActions.innerHTML = "";
@@ -564,68 +478,34 @@ function renderError(title, error) {
 // ---------------------------------------------------------------------------
 async function openProject(projectId) {
   if (presentation) closePresentation();
-  const projectChanged = state.projectId !== null && state.projectId !== projectId;
-  if (projectChanged) resetCollectionView();
   if (state.projectId !== projectId) {
     state.currentId = null;
     state.annotation = null;
     state.dirty = false;
     state.search = "";
     state.imageUrl = "";
+    state.tagFilter = "";
+    state.searchIndex = null;
+    searchHitCache = { query: "", map: new Map() };
   }
   hideConflictBanner();
   state.projectId = projectId;
   try {
-    const [detail, casesRes, projectsRes, collectionsRes] = await Promise.all([
+    const [detail, casesRes, projectsRes] = await Promise.all([
       api.get(projectUrl(projectId)),
       api.get(projectUrl(projectId, "/cases")),
       api.get("/api/projects"),
-      api
-        .get(projectUrl(projectId, "/collections"))
-        .catch(() => ({ collections: [] })),
     ]);
     state.project = detail.project;
     state.schemaInfo = detail.schema;
     state.index = detail.index;
     state.cases = casesRes.cases;
     state.projects = projectsRes.projects || [];
-    state.collections = collectionsRes.collections || [];
     state.selected = new Set();
-
-    if (!projectChanged) {
-      const saved = readSavedCollection();
-      if (saved) {
-        const exists = state.collections.some((item) => item.name === saved.name);
-        if (saved.projectId === projectId && exists) {
-          try {
-            const collection = await api.get(
-              projectUrl(projectId, `/collections/${encodeURIComponent(saved.name)}`)
-            );
-            state.collectionName = saved.name;
-            state.collectionIds = Array.isArray(collection.case_ids)
-              ? collection.case_ids
-              : [];
-            state.leftTab = readLeftTab();
-          } catch (error) {
-            clearSavedCollection();
-            state.leftTab = "images";
-            writeLeftTab("images");
-          }
-        } else {
-          clearSavedCollection();
-          state.leftTab = "images";
-          writeLeftTab("images");
-        }
-      } else {
-        state.leftTab = readLeftTab();
-      }
-    } else {
-      state.leftTab = "images";
-    }
-    normalizeCollectionIds();
 
     renderShell();
     renderCaseList();
+    loadSearchIndex(projectId);
     const target =
       state.currentId && state.cases.some((c) => c.case_id === state.currentId)
         ? state.currentId
@@ -639,21 +519,17 @@ async function openProject(projectId) {
 
 async function refreshProject() {
   const projectId = state.projectId;
-  const [detail, casesRes, collectionsRes] = await Promise.all([
+  const [detail, casesRes] = await Promise.all([
     api.get(projectUrl(projectId)),
     api.get(projectUrl(projectId, "/cases")),
-    api
-      .get(projectUrl(projectId, "/collections"))
-      .catch(() => ({ collections: state.collections })),
   ]);
   state.project = detail.project;
   state.schemaInfo = detail.schema;
   state.index = detail.index;
   state.cases = casesRes.cases;
-  state.collections = collectionsRes.collections || [];
-  normalizeCollectionIds();
   renderShell();
   renderCaseList();
+  loadSearchIndex(projectId);
   if (state.currentId && state.cases.some((c) => c.case_id === state.currentId)) {
     await selectCase(state.currentId);
   } else if (filteredCases()[0]) {
@@ -712,88 +588,38 @@ function renderShell() {
     <div class="editor-wrap">
       <div class="workspace" id="workspace">
         <aside class="pane pane-left">
-          <div class="filter-row left-tabs" id="left-tabs" role="tablist" aria-label="Left panel view">
-            <button type="button" class="chip${state.leftTab === "images" ? " active" : ""}" id="tab-images" data-left-tab="images" role="tab" aria-selected="${state.leftTab === "images"}" aria-controls="panel-images" tabindex="${state.leftTab === "images" ? "0" : "-1"}"><i class="bi bi-images" aria-hidden="true"></i>Images</button>
-            <button type="button" class="chip${state.leftTab === "collections" ? " active" : ""}" id="tab-collections" data-left-tab="collections" role="tab" aria-selected="${state.leftTab === "collections"}" aria-controls="panel-collections" tabindex="${state.leftTab === "collections" ? "0" : "-1"}"><i class="bi bi-collection" aria-hidden="true"></i>Collections</button>
+          <div class="panel-head">
+            <strong><i class="bi bi-images"></i>Images</strong>
+            <span class="count-badge" id="case-count"></span>
+            <span class="flex-grow-1"></span>
+            <button class="btn small ghost" id="btn-select-visible" title="Select all visible cases"><i class="bi bi-check2-square"></i><span class="btn-label">Select all</span></button>
+            <div class="case-search">
+              <i class="bi bi-search" aria-hidden="true"></i>
+              <input id="case-search" type="text" placeholder="Search cases…" aria-label="Search cases" autocomplete="off" spellcheck="false" value="${escapeHtml(state.search)}" />
+              <button type="button" class="search-clear" id="btn-search-clear" title="Clear search" aria-label="Clear search" ${state.search ? "" : "hidden"}><i class="bi bi-x-lg" aria-hidden="true"></i></button>
+            </div>
           </div>
-          <div class="left-tab-panel" id="panel-images" role="tabpanel" aria-labelledby="tab-images" ${state.leftTab === "images" ? "" : "hidden"}>
-            <div class="panel-head">
-              <strong><i class="bi bi-images"></i>Images</strong>
-              <span class="count-badge" id="case-count"></span>
+          <div class="filter-row" id="filter-row" role="group" aria-label="Filter cases"></div>
+          <div class="filter-row tag-row" id="tag-row" role="group" aria-label="Filter by tag" hidden></div>
+          <div class="bulk-bar" id="bulk-bar" role="region" aria-label="Bulk actions" hidden>
+            <div class="bulk-head">
+              <span id="bulk-count">0 selected</span>
               <span class="flex-grow-1"></span>
-              <button class="btn small ghost" id="btn-select-visible" title="Select all visible cases"><i class="bi bi-check2-square"></i><span class="btn-label">Select all</span></button>
-              <div class="case-search">
-                <i class="bi bi-search" aria-hidden="true"></i>
-                <input id="case-search" type="text" placeholder="Search cases…" aria-label="Search cases" autocomplete="off" spellcheck="false" value="${escapeHtml(state.search)}" />
-                <button type="button" class="search-clear" id="btn-search-clear" title="Clear search" aria-label="Clear search" ${state.search ? "" : "hidden"}><i class="bi bi-x-lg" aria-hidden="true"></i></button>
-              </div>
+              <button type="button" class="btn small ghost" id="btn-bulk-clear">Clear</button>
             </div>
-            <div class="filter-row" id="filter-row" role="group" aria-label="Filter cases"></div>
-            <div class="bulk-bar" id="bulk-bar" role="region" aria-label="Bulk actions" hidden>
-              <div class="bulk-head">
-                <span id="bulk-count">0 selected</span>
-                <span class="flex-grow-1"></span>
-                <button type="button" class="btn small ghost" id="btn-bulk-clear">Clear</button>
-              </div>
-              <div class="bulk-actions">
-                <button type="button" class="btn small" data-bulk-action="status" data-bulk-status="done">Mark done</button>
-                <button type="button" class="btn small" data-bulk-action="status" data-bulk-status="draft">Mark draft</button>
-                <button type="button" class="btn small" data-bulk-action="tag" data-bulk-mode="add">Add tag</button>
-                <button type="button" class="btn small" data-bulk-action="tag" data-bulk-mode="remove">Remove tag</button>
-              </div>
-              <form class="bulk-tag-row" id="bulk-tag-row" hidden>
-                <input id="bulk-tag-input" type="text" placeholder="Tag to add" aria-label="Tag" autocomplete="off" spellcheck="false" />
-                <button type="submit" class="btn small primary" id="btn-bulk-tag-apply">Add</button>
-                <button type="button" class="btn small ghost" id="btn-bulk-tag-cancel">Cancel</button>
-              </form>
+            <div class="bulk-actions">
+              <button type="button" class="btn small" data-bulk-action="status" data-bulk-status="done">Mark done</button>
+              <button type="button" class="btn small" data-bulk-action="status" data-bulk-status="draft">Mark draft</button>
+              <button type="button" class="btn small" data-bulk-action="tag" data-bulk-mode="add">Add tag</button>
+              <button type="button" class="btn small" data-bulk-action="tag" data-bulk-mode="remove">Remove tag</button>
             </div>
-            <div class="list-scroll" id="case-list"></div>
+            <form class="bulk-tag-row" id="bulk-tag-row" hidden>
+              <input id="bulk-tag-input" type="text" placeholder="Tag to add" aria-label="Tag" autocomplete="off" spellcheck="false" />
+              <button type="submit" class="btn small primary" id="btn-bulk-tag-apply">Add</button>
+              <button type="button" class="btn small ghost" id="btn-bulk-tag-cancel">Cancel</button>
+            </form>
           </div>
-          <div class="left-tab-panel" id="panel-collections" role="tabpanel" aria-labelledby="tab-collections" ${state.leftTab === "collections" ? "" : "hidden"}>
-            <div class="panel-head">
-              <strong class="collection-heading" id="collection-heading"><i class="bi bi-collection"></i>Collections</strong>
-              <span class="count-badge" id="collection-count"></span>
-              <span class="flex-grow-1"></span>
-              <button type="button" class="btn small ghost" id="btn-collection-new" title="Create a collection from selected cases"><i class="bi bi-plus-lg" aria-hidden="true"></i><span class="btn-label">New collection</span></button>
-              <button type="button" class="btn small ghost" id="btn-collection-clear" title="Leave this collection" hidden><i class="bi bi-x-lg" aria-hidden="true"></i><span class="btn-label">Clear</span></button>
-            </div>
-            <div class="collection-list-view" id="collections-list-view">
-              <div class="list-scroll" id="collections-list"></div>
-            </div>
-            <div class="collection-detail" id="collection-detail-view" hidden>
-              <div class="collection-toolbar" id="collection-actions" role="group" aria-label="Collection actions">
-                <button type="button" class="btn small" id="btn-collection-add" title="Add selected cases to this collection"><i class="bi bi-plus-circle" aria-hidden="true"></i>Add selected</button>
-                <button type="button" class="btn small" id="btn-collection-remove" title="Remove selected cases from this collection"><i class="bi bi-dash-circle" aria-hidden="true"></i>Remove selected</button>
-                <button type="button" class="btn small ghost" id="btn-collection-select-visible" title="Select all visible cases"><i class="bi bi-check2-square" aria-hidden="true"></i>Select all</button>
-                <button type="button" class="btn small ghost" id="btn-collection-present" title="Present collection (p)"><i class="bi bi-easel" aria-hidden="true"></i>Present</button>
-              </div>
-              <div class="case-search collection-search">
-                <i class="bi bi-search" aria-hidden="true"></i>
-                <input id="collection-search" type="text" placeholder="Search in collection…" aria-label="Search in collection" autocomplete="off" spellcheck="false" value="${escapeHtml(state.search)}" />
-                <button type="button" class="search-clear" id="btn-collection-search-clear" title="Clear search" aria-label="Clear search" ${state.search ? "" : "hidden"}><i class="bi bi-x-lg" aria-hidden="true"></i></button>
-              </div>
-              <div class="filter-row" id="collection-filter-row" role="group" aria-label="Filter collection cases"></div>
-              <div class="bulk-bar" id="collection-bulk-bar" role="region" aria-label="Collection bulk actions" hidden>
-                <div class="bulk-head">
-                  <span id="collection-bulk-count">0 selected</span>
-                  <span class="flex-grow-1"></span>
-                  <button type="button" class="btn small ghost" id="btn-collection-bulk-clear">Clear</button>
-                </div>
-                <div class="bulk-actions">
-                  <button type="button" class="btn small" data-bulk-action="status" data-bulk-status="done">Mark done</button>
-                  <button type="button" class="btn small" data-bulk-action="status" data-bulk-status="draft">Mark draft</button>
-                  <button type="button" class="btn small" data-bulk-action="tag" data-bulk-mode="add">Add tag</button>
-                  <button type="button" class="btn small" data-bulk-action="tag" data-bulk-mode="remove">Remove tag</button>
-                </div>
-                <form class="bulk-tag-row" id="collection-bulk-tag-row" hidden>
-                  <input id="collection-bulk-tag-input" type="text" placeholder="Tag to add" aria-label="Tag" autocomplete="off" spellcheck="false" />
-                  <button type="submit" class="btn small primary" id="btn-collection-bulk-tag-apply">Add</button>
-                  <button type="button" class="btn small ghost" id="btn-collection-bulk-tag-cancel">Cancel</button>
-                </form>
-              </div>
-              <div class="list-scroll" id="collection-case-list"></div>
-            </div>
-          </div>
+          <div class="list-scroll" id="case-list"></div>
         </aside>
         <div class="pane-resizer" data-resizer="left" role="separator" aria-orientation="vertical" aria-label="Resize case list" aria-valuemin="${LEFT_MIN}" aria-valuemax="${LEFT_MAX}" aria-valuenow="${paneLayout.left}" tabindex="0"></div>
         <aside class="pane pane-center">
@@ -818,6 +644,8 @@ function renderShell() {
           <div class="viewer-toolbar">
             <button class="btn" id="btn-prev" title="Previous (←)" aria-label="Previous"><i class="bi bi-chevron-left"></i></button>
             <button class="btn" id="btn-next" title="Next (→)" aria-label="Next"><i class="bi bi-chevron-right"></i></button>
+            <span class="sep"></span>
+            <button class="btn" id="btn-present" title="Present current list (p)" aria-label="Present current list"><i class="bi bi-easel"></i></button>
             <span class="sep"></span>
             <button class="btn" id="btn-fit" title="Fit to screen" aria-label="Fit to screen"><i class="bi bi-arrows-fullscreen"></i></button>
             <button class="btn" id="btn-zoom-out" title="Zoom out" aria-label="Zoom out"><i class="bi bi-dash-lg"></i></button>
@@ -912,46 +740,29 @@ function renderShell() {
   document.getElementById("btn-undo").addEventListener("click", () => undoEdit());
   document.getElementById("btn-redo").addEventListener("click", () => redoEdit());
 
-  const searchFields = [
-    {
-      input: document.getElementById("case-search"),
-      clear: document.getElementById("btn-search-clear"),
-    },
-    {
-      input: document.getElementById("collection-search"),
-      clear: document.getElementById("btn-collection-search-clear"),
-    },
-  ].filter((field) => field.input && field.clear);
+  const searchInput = document.getElementById("case-search");
+  const searchClear = document.getElementById("btn-search-clear");
 
   const syncSearchControls = () => {
-    searchFields.forEach((field) => {
-      field.clear.hidden = !state.search;
-    });
+    searchClear.hidden = !state.search;
   };
 
   const runSearch = debounce(() => {
     renderCaseList();
   }, 150);
 
-  searchFields.forEach((field) => {
-    field.input.addEventListener("input", () => {
-      state.search = field.input.value.trim();
-      searchFields.forEach((other) => {
-        if (other.input !== field.input) other.input.value = field.input.value;
-      });
-      syncSearchControls();
-      runSearch();
-    });
-    field.clear.addEventListener("click", () => {
-      state.search = "";
-      searchFields.forEach((other) => {
-        other.input.value = "";
-        other.clear.hidden = true;
-      });
-      runSearch.cancel();
-      renderCaseList();
-      field.input.focus();
-    });
+  searchInput.addEventListener("input", () => {
+    state.search = searchInput.value.trim();
+    syncSearchControls();
+    runSearch();
+  });
+  searchClear.addEventListener("click", () => {
+    state.search = "";
+    searchInput.value = "";
+    searchClear.hidden = true;
+    runSearch.cancel();
+    renderCaseList();
+    searchInput.focus();
   });
 
   const selectVisible = () => {
@@ -964,64 +775,17 @@ function renderShell() {
     renderCaseList();
   };
   document.getElementById("btn-select-visible").addEventListener("click", selectVisible);
-  document
-    .getElementById("btn-collection-select-visible")
-    .addEventListener("click", selectVisible);
 
-  [document.getElementById("bulk-bar"), document.getElementById("collection-bulk-bar")]
-    .filter(Boolean)
-    .forEach((bar) => bar.addEventListener("click", onBulkBarClick));
+  document.getElementById("bulk-bar").addEventListener("click", onBulkBarClick);
   document.getElementById("btn-bulk-clear").addEventListener("click", clearSelection);
-  document
-    .getElementById("btn-collection-bulk-clear")
-    .addEventListener("click", clearSelection);
-  [document.getElementById("bulk-tag-row"), document.getElementById("collection-bulk-tag-row")]
-    .filter(Boolean)
-    .forEach((row) => row.addEventListener("submit", onBulkTagSubmit));
-  [document.getElementById("btn-bulk-tag-cancel"), document.getElementById("btn-collection-bulk-tag-cancel")]
-    .filter(Boolean)
-    .forEach((button) => button.addEventListener("click", hideBulkTagRow));
-  [document.getElementById("bulk-tag-input"), document.getElementById("collection-bulk-tag-input")]
-    .filter(Boolean)
-    .forEach((input) => {
-      input.addEventListener("keydown", (event) => {
-        if (event.key !== "Escape") return;
-        event.preventDefault();
-        hideBulkTagRow();
-      });
-    });
-
-  document.querySelectorAll("#left-tabs [data-left-tab]").forEach((tab) => {
-    tab.addEventListener("click", () => setLeftTab(tab.dataset.leftTab));
-    tab.addEventListener("keydown", (event) => {
-      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-      event.preventDefault();
-      const tabs = [...document.querySelectorAll("#left-tabs [data-left-tab]")];
-      const index = tabs.indexOf(tab);
-      const next = tabs[(index + (event.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length];
-      if (next) {
-        next.focus();
-        setLeftTab(next.dataset.leftTab);
-      }
-    });
+  document.getElementById("bulk-tag-row").addEventListener("submit", onBulkTagSubmit);
+  document.getElementById("btn-bulk-tag-cancel").addEventListener("click", hideBulkTagRow);
+  const bulkTagInput = document.getElementById("bulk-tag-input");
+  bulkTagInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    hideBulkTagRow();
   });
-
-  document.getElementById("btn-collection-new").addEventListener("click", createCollectionFromSelection);
-  document.getElementById("btn-collection-clear").addEventListener("click", () => exitCollection());
-  document.getElementById("btn-collection-add").addEventListener("click", addSelectedToCollection);
-  document.getElementById("btn-collection-remove").addEventListener("click", removeSelectedFromCollection);
-  document.getElementById("btn-collection-present").addEventListener("click", openPresentation);
-  document.getElementById("collections-list").addEventListener("click", (event) => {
-    const remove = event.target.closest("[data-collection-delete]");
-    if (remove) {
-      event.stopPropagation();
-      deleteCollection(remove.dataset.collectionDelete);
-      return;
-    }
-    const row = event.target.closest("[data-collection]");
-    if (row) enterCollection(row.dataset.collection);
-  });
-  document.getElementById("collection-case-list").addEventListener("click", onCaseListClick);
 
   const statusSelect = document.getElementById("status-select");
   statusSelect.addEventListener("change", () => {
@@ -1060,6 +824,7 @@ function renderShell() {
   document.getElementById("btn-rotate").addEventListener("click", () => viewer.rotate());
   document.getElementById("btn-prev").addEventListener("click", () => gotoRelative(-1));
   document.getElementById("btn-next").addEventListener("click", () => gotoRelative(1));
+  document.getElementById("btn-present").addEventListener("click", openPresentation);
 
   document.getElementById("case-list").addEventListener("click", onCaseListClick);
   document.getElementById("thumb-strip").addEventListener("click", (event) => {
@@ -1103,8 +868,6 @@ function renderShell() {
 
   applyPaneLayout();
   applyRawCollapsed();
-  applyLeftTab();
-  renderCollectionPanel();
   observeStage(stage);
   updateUndoButtons();
 }
@@ -1112,13 +875,54 @@ function renderShell() {
 // ---------------------------------------------------------------------------
 // 列表
 // ---------------------------------------------------------------------------
+let searchHitCache = { query: "", map: new Map() };
+
+function searchHitsFor(item, needle) {
+  if (searchHitCache.query !== needle) {
+    searchHitCache = { query: needle, map: new Map() };
+  }
+  if (searchHitCache.map.has(item.case_id)) {
+    return searchHitCache.map.get(item.case_id);
+  }
+  const entries = state.searchIndex ? state.searchIndex[item.case_id] || [] : [];
+  const hits = entries.filter((entry) => {
+    if (String(entry.text || "").toLowerCase().includes(needle)) return true;
+    if (String(entry.label || "").toLowerCase().includes(needle)) return true;
+    return String(entry.path || "").toLowerCase().includes(needle);
+  });
+  searchHitCache.map.set(item.case_id, hits);
+  return hits;
+}
+
 function matchesSearch(item, query) {
   if (!query) return true;
   const needle = query.toLowerCase();
-  return (
+  if (String(item.case_id || "").toLowerCase().includes(needle)) return true;
+  if (String(item.source || "").toLowerCase().includes(needle)) return true;
+  return searchHitsFor(item, needle).length > 0;
+}
+
+function fieldHitsFor(item) {
+  if (!state.search) return [];
+  const needle = state.search.toLowerCase();
+  if (
     String(item.case_id || "").toLowerCase().includes(needle) ||
     String(item.source || "").toLowerCase().includes(needle)
-  );
+  ) {
+    return [];
+  }
+  return searchHitsFor(item, needle);
+}
+
+async function loadSearchIndex(projectId) {
+  try {
+    const res = await api.get(projectUrl(projectId, "/search-index"));
+    if (state.projectId !== projectId) return;
+    state.searchIndex = res.cases || {};
+    if (state.search) renderCaseList();
+  } catch (error) {
+    /* 全局搜索不可用时，仍可搜索 case ID 与路径 */
+  }
 }
 
 function caseMatchesFilter(item, key) {
@@ -1128,6 +932,8 @@ function caseMatchesFilter(item, key) {
       return Boolean(annotation && annotation.diff_count > 0);
     case "unlabeled":
       return !annotation;
+    case "low":
+      return Boolean(annotation && annotation.low_confidence > 0);
     case "done":
       return Boolean(annotation && annotation.status === "done");
     case "notes":
@@ -1145,8 +951,25 @@ function filterIn(items) {
   return items.filter((item) => caseMatchesFilter(item, state.filter));
 }
 
+function tagCounts(items) {
+  const counts = new Map();
+  for (const item of items) {
+    const tags =
+      item.annotation && Array.isArray(item.annotation.tags) ? item.annotation.tags : [];
+    for (const tag of new Set(tags)) counts.set(tag, (counts.get(tag) || 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+function matchesTag(item) {
+  if (!state.tagFilter) return true;
+  const tags =
+    item.annotation && Array.isArray(item.annotation.tags) ? item.annotation.tags : [];
+  return tags.includes(state.tagFilter);
+}
+
 function searchedCases() {
-  return searchIn(scopedCases());
+  return searchIn(state.cases).filter(matchesTag);
 }
 
 function filteredCases() {
@@ -1190,12 +1013,56 @@ function groupedCasesHtml(visible) {
     .join("");
 }
 
+function renderTagChips(items) {
+  const row = document.getElementById("tag-row");
+  if (!row) return;
+  const counts = tagCounts(items);
+  if (!counts.length) {
+    row.hidden = true;
+    row.innerHTML = "";
+    state.tagFilter = "";
+    return;
+  }
+  if (state.tagFilter && !counts.some(([tag]) => tag === state.tagFilter)) {
+    state.tagFilter = "";
+  }
+  row.hidden = false;
+  row.innerHTML = counts
+    .map(
+      ([tag, count]) =>
+        `<button type="button" class="chip tag-chip${state.tagFilter === tag ? " active" : ""}" data-tag="${escapeHtml(tag)}" aria-pressed="${state.tagFilter === tag}"><i class="bi bi-tag" aria-hidden="true"></i>${escapeHtml(tag)} <span class="chip-count">${count}</span></button>`
+    )
+    .join("");
+  row.querySelectorAll("[data-tag]").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const tag = chip.dataset.tag;
+      state.tagFilter = state.tagFilter === tag ? "" : tag;
+      renderCaseList();
+    });
+  });
+}
+
 function renderImagesCaseList() {
   const list = document.getElementById("case-list");
   if (!list) return;
-  const base = searchIn(state.cases);
+  const searched = searchIn(state.cases);
+  renderTagChips(searched);
+  const base = searched.filter(matchesTag);
   renderFilterChips(document.getElementById("filter-row"), base);
-  const visible = filterIn(base);
+  let visible = filterIn(base);
+  if (state.filter === "low") {
+    visible = [...visible].sort((a, b) => {
+      const left =
+        a.annotation && typeof a.annotation.confidence_min === "number"
+          ? a.annotation.confidence_min
+          : 1;
+      const right =
+        b.annotation && typeof b.annotation.confidence_min === "number"
+          ? b.annotation.confidence_min
+          : 1;
+      return left - right;
+    });
+  }
   const count = document.getElementById("case-count");
   if (count) count.textContent = `${visible.length}/${state.cases.length}`;
 
@@ -1205,340 +1072,25 @@ function renderImagesCaseList() {
       "bi-images",
       "No images in this project."
     );
-  } else if (state.search && !base.length) {
+  } else if (state.search && !searched.length) {
     emptyState = listEmptyHtml(
       "bi-search",
       `No cases match “${state.search}”.`
+    );
+  } else if (state.tagFilter && !base.length) {
+    emptyState = listEmptyHtml(
+      "bi-tag",
+      `No cases tagged “${state.tagFilter}”.`
     );
   }
   list.innerHTML = groupedCasesHtml(visible) || emptyState;
 }
 
-function renderCollectionCaseList() {
-  const list = document.getElementById("collection-case-list");
-  if (!list) return;
-  if (!state.collectionName) {
-    list.innerHTML = "";
-    return;
-  }
-  const items = collectionCases();
-  const base = searchIn(items);
-  renderFilterChips(document.getElementById("collection-filter-row"), base);
-  const visible = filterIn(base);
-
-  let emptyState = listEmptyHtml(
-    "bi-funnel",
-    "No cases match this filter."
-  );
-  if (!items.length) {
-    emptyState = listEmptyHtml(
-      "bi-collection",
-      "This collection is empty. Use Add selected to include cases."
-    );
-  } else if (state.search && !base.length) {
-    emptyState = listEmptyHtml(
-      "bi-search",
-      `No cases match “${state.search}”.`
-    );
-  }
-  list.innerHTML = visible.map(caseRowHtml).join("") || emptyState;
-}
-
 function renderCaseList() {
   renderImagesCaseList();
-  renderCollectionCaseList();
   updateBulkBar();
   renderThumbs();
 }
-
-// ---------------------------------------------------------------------------
-// Collections
-// ---------------------------------------------------------------------------
-function applyLeftTab() {
-  const imagesPanel = document.getElementById("panel-images");
-  const collectionsPanel = document.getElementById("panel-collections");
-  if (imagesPanel) imagesPanel.hidden = state.leftTab !== "images";
-  if (collectionsPanel) collectionsPanel.hidden = state.leftTab !== "collections";
-  document.querySelectorAll("#left-tabs [data-left-tab]").forEach((tab) => {
-    const active = tab.dataset.leftTab === state.leftTab;
-    tab.classList.toggle("active", active);
-    tab.setAttribute("aria-selected", String(active));
-    tab.tabIndex = active ? 0 : -1;
-  });
-}
-
-function setLeftTab(tab, { persist = true } = {}) {
-  state.leftTab = tab === "collections" ? "collections" : "images";
-  if (persist) writeLeftTab(state.leftTab);
-  applyLeftTab();
-  renderCollectionPanel();
-  renderCaseList();
-}
-
-function renderCollectionsList() {
-  const list = document.getElementById("collections-list");
-  if (!list) return;
-  if (!state.collections.length) {
-    list.innerHTML = listEmptyHtml(
-      "bi-collection",
-      "No collections yet. Select cases in the Images tab, then click New collection."
-    );
-    return;
-  }
-  list.innerHTML = state.collections
-    .map(
-      (collection) => `<div class="collection-item">
-        <button type="button" class="collection-open" data-collection="${escapeHtml(collection.name)}" aria-label="Open collection ${escapeHtml(collection.name)}">
-          <span class="collection-icon" aria-hidden="true"><i class="bi bi-collection"></i></span>
-          <span class="collection-name" title="${escapeHtml(collection.name)}">${escapeHtml(collection.name)}</span>
-          <span class="collection-count">${Number(collection.count) || 0}</span>
-        </button>
-        <button type="button" class="collection-delete" data-collection-delete="${escapeHtml(collection.name)}" title="Delete collection" aria-label="Delete collection ${escapeHtml(collection.name)}"><i class="bi bi-trash3" aria-hidden="true"></i></button>
-      </div>`
-    )
-    .join("");
-}
-
-function renderCollectionPanel() {
-  const heading = document.getElementById("collection-heading");
-  if (!heading) return;
-  const active = Boolean(state.collectionName);
-  const count = document.getElementById("collection-count");
-  const newButton = document.getElementById("btn-collection-new");
-  const clearButton = document.getElementById("btn-collection-clear");
-  const listView = document.getElementById("collections-list-view");
-  const detailView = document.getElementById("collection-detail-view");
-  const addButton = document.getElementById("btn-collection-add");
-  const removeButton = document.getElementById("btn-collection-remove");
-  const presentButton = document.getElementById("btn-collection-present");
-  const selectButton = document.getElementById("btn-collection-select-visible");
-
-  if (active) {
-    heading.innerHTML = `<i class="bi bi-collection"></i><span class="collection-heading-text">Collection: <span class="collection-heading-name">${escapeHtml(state.collectionName)}</span></span>`;
-    if (count) count.textContent = String(collectionCases().length);
-  } else {
-    heading.innerHTML = `<i class="bi bi-collection"></i><span class="collection-heading-text">Collections</span>`;
-    if (count) count.textContent = String(state.collections.length);
-  }
-  if (newButton) newButton.hidden = active;
-  if (clearButton) clearButton.hidden = !active;
-  if (listView) listView.hidden = active;
-  if (detailView) detailView.hidden = !active;
-
-  const busy = state.collectionBusy;
-  const hasCases = collectionCases().length > 0;
-  if (addButton) addButton.disabled = busy;
-  if (removeButton) removeButton.disabled = busy;
-  if (selectButton) selectButton.disabled = busy;
-  if (presentButton) {
-    presentButton.disabled = busy || !hasCases;
-    presentButton.title = hasCases
-      ? "Present collection (p)"
-      : "This collection has no cases";
-  }
-  renderCollectionsList();
-}
-
-async function loadCollections() {
-  const projectId = state.projectId;
-  if (!projectId) return;
-  const res = await api.get(projectUrl(projectId, "/collections"));
-  if (state.projectId !== projectId) return;
-  state.collections = res.collections || [];
-}
-
-async function enterCollection(name, { selectFirst = true } = {}) {
-  if (!state.projectId || !name) return;
-  const projectId = state.projectId;
-  try {
-    const collection = await api.get(
-      projectUrl(projectId, `/collections/${encodeURIComponent(name)}`)
-    );
-    if (state.projectId !== projectId) return;
-    state.collectionName = collection.name || name;
-    state.collectionIds = Array.isArray(collection.case_ids)
-      ? collection.case_ids
-      : [];
-    normalizeCollectionIds();
-    state.selected = new Set();
-    state.leftTab = "collections";
-    writeLeftTab("collections");
-    writeSavedCollection(state.collectionName);
-    applyLeftTab();
-    renderCollectionPanel();
-    renderCaseList();
-
-    if (
-      selectFirst &&
-      (!state.currentId || !state.collectionIds.includes(state.currentId))
-    ) {
-      const first = filteredCases()[0];
-      if (first) await selectCase(first.case_id);
-      else renderEmptyCase("No cases in this collection match the current filters.");
-    }
-  } catch (error) {
-    toast(error.message, true);
-    try {
-      await loadCollections();
-      renderCollectionPanel();
-    } catch (loadError) {
-      /* keep the current panel state */
-    }
-  }
-}
-
-function exitCollection({ keepTab = true } = {}) {
-  state.collectionName = null;
-  state.collectionIds = [];
-  state.selected = new Set();
-  clearSavedCollection();
-  if (!keepTab) {
-    state.leftTab = "images";
-    writeLeftTab("images");
-  }
-  applyLeftTab();
-  renderCollectionPanel();
-  renderCaseList();
-}
-
-function createCollectionFromSelection() {
-  if (!state.projectId) return;
-  if (!state.selected.size) {
-    toast("Select cases in the Images tab first", true);
-    return;
-  }
-  const caseIds = state.cases
-    .filter((item) => state.selected.has(item.case_id))
-    .map((item) => item.case_id);
-  openCollectionNameModal({
-    title: "New collection",
-    submitLabel: "Create collection",
-    onConfirm: async (name) => {
-      const res = await api.put(
-        projectUrl(state.projectId, `/collections/${encodeURIComponent(name)}`),
-        { case_ids: caseIds }
-      );
-      await loadCollections();
-      renderCollectionPanel();
-      toast(
-        `Collection "${res.name}" created with ${res.case_ids.length} case${
-          res.case_ids.length === 1 ? "" : "s"
-        }`
-      );
-    },
-  });
-}
-
-async function saveCollectionIds(nextIds, successMessage) {
-  if (state.collectionBusy || !state.projectId || !state.collectionName) return false;
-  const projectId = state.projectId;
-  const name = state.collectionName;
-  state.collectionBusy = true;
-  renderCollectionPanel();
-  try {
-    const res = await api.put(
-      projectUrl(projectId, `/collections/${encodeURIComponent(name)}`),
-      { case_ids: nextIds }
-    );
-    if (state.projectId !== projectId) return false;
-    state.collectionIds = Array.isArray(res.case_ids) ? res.case_ids : nextIds;
-    state.selected = new Set();
-    await loadCollections();
-    writeSavedCollection(name);
-    renderCollectionPanel();
-    renderCaseList();
-    toast(successMessage);
-    return true;
-  } catch (error) {
-    const unknown = error.detail && Array.isArray(error.detail.unknown)
-      ? error.detail.unknown
-      : [];
-    toast(
-      unknown.length
-        ? `${error.message}: ${unknown.join(", ")}`
-        : error.message,
-      true
-    );
-    return false;
-  } finally {
-    state.collectionBusy = false;
-    if (state.projectId === projectId) renderCollectionPanel();
-  }
-}
-
-function addSelectedToCollection() {
-  if (!state.collectionName) return;
-  if (!state.selected.size) {
-    toast("Select cases first", true);
-    return;
-  }
-  const next = [...state.collectionIds];
-  const seen = new Set(next);
-  let added = 0;
-  for (const item of state.cases) {
-    if (!state.selected.has(item.case_id) || seen.has(item.case_id)) continue;
-    next.push(item.case_id);
-    seen.add(item.case_id);
-    added += 1;
-  }
-  if (!added) {
-    toast("Selected cases are already in this collection");
-    return;
-  }
-  saveCollectionIds(
-    next,
-    `Added ${added} case${added === 1 ? "" : "s"} to this collection`
-  );
-}
-
-function removeSelectedFromCollection() {
-  if (!state.collectionName) return;
-  if (!state.selected.size) {
-    toast("Select cases first", true);
-    return;
-  }
-  const next = state.collectionIds.filter((id) => !state.selected.has(id));
-  const removed = state.collectionIds.length - next.length;
-  if (!removed) {
-    toast("No selected cases in this collection", true);
-    return;
-  }
-  saveCollectionIds(
-    next,
-    `Removed ${removed} case${removed === 1 ? "" : "s"} from this collection`
-  );
-}
-
-async function deleteCollection(name) {
-  if (!state.projectId || !name) return;
-  if (!window.confirm(`Delete collection "${name}"? Cases and annotations are not affected.`)) {
-    return;
-  }
-  const projectId = state.projectId;
-  try {
-    await api.del(
-      projectUrl(projectId, `/collections/${encodeURIComponent(name)}`)
-    );
-    if (state.projectId !== projectId) return;
-    const wasActive = state.collectionName === name;
-    if (wasActive) {
-      state.collectionName = null;
-      state.collectionIds = [];
-      state.selected = new Set();
-      clearSavedCollection();
-      state.leftTab = "images";
-      writeLeftTab("images");
-    }
-    await loadCollections();
-    applyLeftTab();
-    renderCollectionPanel();
-    renderCaseList();
-    toast(`Collection "${name}" deleted`);
-  } catch (error) {
-    toast(error.message, true);
-  }
-}
-
 
 function caseRowHtml(item) {
   const annotation = item.annotation;
@@ -1578,18 +1130,47 @@ function caseRowHtml(item) {
       `<span class="badge tag" title="${escapeHtml(tags.join(", "))}"><i class="bi bi-tag"></i>${tags.length}</span>`
     );
   }
+  if (
+    annotation &&
+    typeof annotation.confidence_min === "number" &&
+    annotation.confidence_min < LOW_CONFIDENCE
+  ) {
+    const percent = Math.round(annotation.confidence_min * 100);
+    badges.push(
+      `<span class="badge conf" title="Lowest model confidence ${percent}%${annotation.low_confidence ? ` · ${annotation.low_confidence} field(s) below ${Math.round(LOW_CONFIDENCE * 100)}%` : ""}"><i class="bi bi-exclamation-triangle"></i>${percent}%</span>`
+    );
+  }
+  const hits = fieldHitsFor(item);
+  const hitHtml = hits.length
+    ? `<span class="case-hits">${hits
+        .slice(0, 2)
+        .map(
+          (hit) =>
+            `<button type="button" class="case-hit" data-hit-case="${escapeHtml(item.case_id)}" data-hit-path="${escapeHtml(hit.path)}" title="${escapeHtml(`${hit.kind === "note" ? "Note" : "Value"}: ${hit.text}`)}">${escapeHtml(hit.label || hit.path)}</button>`
+        )
+        .join("")}${
+        hits.length > 2 ? `<span class="case-hit-more">+${hits.length - 2}</span>` : ""
+      }</span>`
+    : "";
   return `<div class="case-item list-group-item${item.case_id === state.currentId ? " active" : ""}" data-case="${escapeHtml(item.case_id)}">
     <input type="checkbox" data-check="${escapeHtml(item.case_id)}" ${state.selected.has(item.case_id) ? "checked" : ""} aria-label="Select case" />
     <span class="${dotClass}" title="${dotTitle}"></span>
     <span class="case-name" title="${escapeHtml(fullTitle)}">
       <span class="case-file">${escapeHtml(displayName)}</span>
       ${dirPath ? `<span class="case-dir">${escapeHtml(dirPath)}</span>` : ""}
+      ${hitHtml}
     </span>
     ${badges.join("")}
   </div>`;
 }
 
 function onCaseListClick(event) {
+  const hit = event.target.closest("[data-hit-path]");
+  if (hit) {
+    event.preventDefault();
+    jumpToCaseField(hit.dataset.hitCase, hit.dataset.hitPath);
+    return;
+  }
   const checkbox = event.target.closest("[data-check]");
   if (checkbox) {
     const id = checkbox.dataset.check;
@@ -1634,9 +1215,24 @@ function gotoNextUnlabeled(options = {}) {
   return false;
 }
 
+async function markDoneAndAdvance() {
+  if (!state.currentId || !state.annotation) return;
+  if (state.conflict) {
+    toast("Resolve the save conflict first", true);
+    return;
+  }
+  state.annotation.status = "done";
+  const select = document.getElementById("status-select");
+  if (select) select.value = "done";
+  markDirty();
+  const saved = await saveNow(true, { advance: false });
+  if (saved && filteredCases().length > 1) gotoRelative(1);
+}
+
 // ---------------------------------------------------------------------------
 // Thumbnail strip
 // ---------------------------------------------------------------------------
+
 function thumbPreviewUrl(caseId) {
   return projectUrl(
     state.projectId,
@@ -1752,35 +1348,27 @@ function renderThumbs() {
 // ---------------------------------------------------------------------------
 // Bulk actions
 // ---------------------------------------------------------------------------
-function bulkBars() {
-  return ["bulk-bar", "collection-bulk-bar"]
-    .map((id) => document.getElementById(id))
-    .filter(Boolean);
+function bulkBar() {
+  return document.getElementById("bulk-bar");
 }
 
 function updateBulkBar() {
-  const bars = bulkBars();
-  if (!bars.length) return;
+  const bar = bulkBar();
+  if (!bar) return;
   const count = state.selected.size;
-  bars.forEach((bar) => {
-    bar.hidden = count === 0;
-  });
-  const labels = ["bulk-count", "collection-bulk-count"]
-    .map((id) => document.getElementById(id))
-    .filter(Boolean);
-  labels.forEach((label) => {
-    label.textContent = `${count} selected`;
-  });
+  bar.hidden = count === 0;
+  const label = document.getElementById("bulk-count");
+  if (label) label.textContent = `${count} selected`;
   if (!count) hideBulkTagRow();
   setBulkBusy(state.bulkBusy);
 }
 
 function setBulkBusy(busy) {
-  bulkBars().forEach((bar) => {
-    bar.classList.toggle("busy", busy);
-    bar.querySelectorAll("button, input").forEach((node) => {
-      node.disabled = busy;
-    });
+  const bar = bulkBar();
+  if (!bar) return;
+  bar.classList.toggle("busy", busy);
+  bar.querySelectorAll("button, input").forEach((node) => {
+    node.disabled = busy;
   });
 }
 
@@ -1792,11 +1380,7 @@ function hideBulkTagRow() {
 }
 
 function activeBulkTagRow() {
-  return document.getElementById(
-    collectionActive() && state.leftTab === "collections"
-      ? "collection-bulk-tag-row"
-      : "bulk-tag-row"
-  );
+  return document.getElementById("bulk-tag-row");
 }
 
 function showBulkTagRow(mode) {
@@ -1861,12 +1445,9 @@ async function runBulk(payload) {
     const saved = await saveNow(true, { advance: false });
     if (!saved) return;
   }
-  const allowed = collectionActive()
-    ? new Set(collectionCases().map((item) => item.case_id))
-    : null;
-  const caseIds = [...state.selected].filter((id) => !allowed || allowed.has(id));
+  const caseIds = [...state.selected];
   if (!caseIds.length) {
-    toast("No selected cases in this collection", true);
+    toast("No cases selected", true);
     return;
   }
   state.bulkBusy = true;
@@ -2159,6 +1740,7 @@ function renderFormArea() {
     schema: state.schemaInfo.schema,
     values: state.values,
     notes: state.annotation.notes || {},
+    confidence: state.annotation.confidence || {},
     diffFields: state.diffFields,
     onChange: markDirty,
     onRevert: revertField,
@@ -2766,6 +2348,8 @@ function updateCurrentSummary() {
     notes_count: Object.values(notes).filter((value) => String(value).trim()).length,
     has_baseline: item.annotation ? item.annotation.has_baseline : false,
     diff_count: state.diffFields.length,
+    confidence_min: item.annotation ? item.annotation.confidence_min : null,
+    low_confidence: item.annotation ? item.annotation.low_confidence : 0,
   };
   renderCaseList();
   updateProgress();
@@ -2816,7 +2400,7 @@ function openImport() {
 }
 
 function openExport() {
-  const baseCases = collectionActive() ? collectionCases() : state.cases;
+  const baseCases = state.cases;
   openExportModal({
     projectId: state.projectId,
     allCases: baseCases,
@@ -3164,7 +2748,7 @@ function movePresentation(delta) {
 
 function closePresentation() {
   if (!presentation) return;
-  const restore = document.getElementById("btn-collection-present");
+  const restore = document.getElementById("btn-present");
   document.removeEventListener("keydown", onPresentationKey, true);
   presentation.el.remove();
   presentation = null;
@@ -3205,12 +2789,15 @@ function onPresentationKey(event) {
   }
 }
 
+function currentScopeLabel() {
+  if (state.tagFilter) return `Tag: ${state.tagFilter}`;
+  if (state.search) return `Search: ${state.search}`;
+  const filter = FILTERS.find((item) => item.key === state.filter);
+  return filter && filter.key !== "all" ? filter.label : "All cases";
+}
+
 function openPresentation() {
-  if (presentation || state.collectionBusy) return;
-  if (!collectionActive()) {
-    toast("Open a collection first", true);
-    return;
-  }
+  if (presentation) return;
   const items = filteredCases().map((item) => item.case_id);
   if (!items.length) {
     toast("No cases to present", true);
@@ -3218,7 +2805,7 @@ function openPresentation() {
   }
   const currentIndex = Math.max(0, items.indexOf(state.currentId));
   presentation = {
-    name: state.collectionName,
+    name: currentScopeLabel(),
     projectId: state.projectId,
     items,
     index: currentIndex,
@@ -3251,7 +2838,8 @@ function openHelpModal() {
     ["<kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Shift</kbd> + <kbd>Z</kbd>", "Redo the last undone edit"],
     ["<kbd>f</kbd>", "Toggle image fullscreen"],
     ["<kbd>0</kbd>", "Fit image to window"],
-    ["<kbd>p</kbd>", "Present the open collection"],
+    ["<kbd>p</kbd>", "Present the visible list"],
+    ["<kbd>Space</kbd>", "Mark the current case done and open the next one"],
     ["<kbd>Esc</kbd>", "Close presentation or dialog"],
     ["<kbd>?</kbd>", "Open this help"],
   ];
@@ -3391,9 +2979,12 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault();
     if (viewer) viewer.fit();
   } else if (event.key === "p") {
-    if (!collectionActive() || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
     event.preventDefault();
     openPresentation();
+  } else if (event.key === " ") {
+    event.preventDefault();
+    markDoneAndAdvance();
   } else if (event.key === "ArrowLeft") {
     event.preventDefault();
     gotoRelative(-1);

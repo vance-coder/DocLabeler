@@ -463,7 +463,14 @@ export function openNotesPromptModal({ projectId, onJumpToCase }) {
   exportLink.href = projectUrl(projectId, "/notes/summary.csv");
   exportLink.setAttribute("download", "");
   exportLink.title = "Download the notes summary as CSV";
-  exportLink.innerHTML = '<i class="bi bi-download" aria-hidden="true"></i>Export CSV';
+  exportLink.innerHTML = '<i class="bi bi-download" aria-hidden="true"></i>Notes CSV';
+
+  const correctionsLink = document.createElement("a");
+  correctionsLink.className = "btn";
+  correctionsLink.href = projectUrl(projectId, "/corrections.csv");
+  correctionsLink.setAttribute("download", "");
+  correctionsLink.title = "Fields where your values differ from the imported baseline, grouped by field";
+  correctionsLink.innerHTML = '<i class="bi bi-arrow-repeat" aria-hidden="true"></i>Corrections CSV';
 
   const close = mk("button", "btn primary");
   close.type = "button";
@@ -471,6 +478,7 @@ export function openNotesPromptModal({ projectId, onJumpToCase }) {
   close.addEventListener("click", () => modal.close());
 
   modal.foot.appendChild(exportLink);
+  modal.foot.appendChild(correctionsLink);
   modal.foot.appendChild(mk("span", "notes-foot-spacer"));
   modal.foot.appendChild(close);
 
