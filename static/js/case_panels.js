@@ -145,6 +145,12 @@ function renderEmptyCase(message) {
     source.textContent = "";
     source.title = "";
   }
+  const copyButton = document.getElementById("btn-copy-filename");
+  if (copyButton) copyButton.hidden = true;
+  const tagChips = document.getElementById("case-tags");
+  if (tagChips) tagChips.innerHTML = "";
+  const tagsInput = document.getElementById("tags-input");
+  if (tagsInput) tagsInput.value = "";
   const warning = document.getElementById("case-warning");
   if (warning) {
     warning.textContent = "";

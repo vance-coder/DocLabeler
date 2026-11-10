@@ -4,7 +4,7 @@
  * 从 main.js 拆分而来；状态见 state.js，跨模块调用统一走 actions。
  */
 import { state, ui, actions, dom, PANE, KEYS, writeFlag } from "./state.js";
-import { debounce, escapeHtml } from "./util.js";
+import { copyText, debounce, escapeHtml, toast } from "./util.js";
 import { createViewer } from "./viewer.js";
 
 function renderShell() {
@@ -97,6 +97,9 @@ function renderShell() {
         <aside class="pane pane-center">
           <div class="case-bar">
             <span class="source" id="case-source"></span>
+            <button type="button" class="btn small ghost icon-only" id="btn-copy-filename" title="Copy file name" aria-label="Copy file name" hidden>
+              <i class="bi bi-clipboard" aria-hidden="true"></i>
+            </button>
             <span id="case-warning"></span>
           </div>
           <div class="viewer-stage" id="viewer-stage">
@@ -147,8 +150,11 @@ function renderShell() {
               <option value="draft">Draft</option>
               <option value="done">Done</option>
             </select>
-            <input id="tags-input" placeholder="Tags, comma separated" aria-label="Tags" style="flex:1;min-width:120px" list="case-tag-options" autocomplete="off" spellcheck="false" />
-            <datalist id="case-tag-options"></datalist>
+            <div class="tags-field">
+              <span class="case-tags" id="case-tags"></span>
+              <input id="tags-input" placeholder="+ tag" aria-label="Add tag" list="case-tag-options" autocomplete="off" spellcheck="false" />
+              <datalist id="case-tag-options"></datalist>
+            </div>
             <span class="save-state" id="save-state" role="status" aria-live="polite">Not loaded</span>
           </div>
           <div class="diff-bar" id="diff-bar" hidden>
@@ -276,20 +282,42 @@ function renderShell() {
   });
   const tagsInput = document.getElementById("tags-input");
   tagsInput.addEventListener("focus", () => actions.fillCaseTagOptions());
-  tagsInput.addEventListener("change", () => {
-    if (!state.annotation) return;
-    const seen = new Set();
-    state.annotation.tags = tagsInput.value
+  const addTagsFromInput = () => {
+    const tags = tagsInput.value
       .split(/[,，\s]+/)
       .map((s) => s.trim())
-      .filter((tag) => {
-        if (!tag) return false;
-        const key = tag.toLowerCase();
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
+      .filter(Boolean);
+    tagsInput.value = "";
+    if (!state.annotation || !tags.length) return;
+    const current = state.annotation.tags || [];
+    const seen = new Set(current.map((tag) => String(tag).toLowerCase()));
+    let changed = false;
+    for (const tag of tags) {
+      const key = tag.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      current.push(tag);
+      changed = true;
+    }
+    if (!changed) return;
+    state.annotation.tags = current;
+    actions.renderCaseTags();
     actions.markDirty();
+  };
+  tagsInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    addTagsFromInput();
+  });
+  tagsInput.addEventListener("change", addTagsFromInput);
+
+  const copyButton = document.getElementById("btn-copy-filename");
+  copyButton.addEventListener("click", async () => {
+    const item = state.cases.find((c) => c.case_id === state.currentId);
+    if (!item) return;
+    const name = String(item.source || "").split(/[\\/]/).pop();
+    const ok = await copyText(name);
+    toast(ok ? `Copied ${name}` : "Copy failed", !ok);
   });
 
   const stage = document.getElementById("viewer-stage");
@@ -364,6 +392,30 @@ function renderShell() {
   actions.updateUndoButtons();
 }
 
+/** 右侧标签 chips：每个标签可单独删除，输入框只负责新增。 */
+function renderCaseTags() {
+  const container = document.getElementById("case-tags");
+  if (!container) return;
+  const tags = (state.annotation && state.annotation.tags) || [];
+  container.innerHTML = tags
+    .map(
+      (tag, index) =>
+        `<span class="case-tag">${escapeHtml(tag)}<button type="button" class="case-tag-remove" data-index="${index}" title="Remove ${escapeHtml(tag)}" aria-label="Remove ${escapeHtml(tag)}">×</button></span>`
+    )
+    .join("");
+  container.querySelectorAll(".case-tag-remove").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (!state.annotation) return;
+      const rest = [...(state.annotation.tags || [])];
+      rest.splice(Number(button.dataset.index), 1);
+      state.annotation.tags = rest;
+      renderCaseTags();
+      actions.markDirty();
+    });
+  });
+}
+
 Object.assign(actions, {
   renderShell,
+  renderCaseTags,
 });

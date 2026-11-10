@@ -71,6 +71,10 @@ function renderCase() {
   const sourceNode = document.getElementById("case-source");
   sourceNode.innerHTML = `<i class="bi bi-file-earmark-image"></i><span>${escapeHtml(item.source)}</span>`;
   sourceNode.title = item.source;
+  const copyButton = document.getElementById("btn-copy-filename");
+  if (copyButton) copyButton.hidden = false;
+  const tagsInput = document.getElementById("tags-input");
+  if (tagsInput) tagsInput.value = "";
   const warning = document.getElementById("case-warning");
   warning.textContent = item.warning || "";
   warning.className = item.warning ? "warning" : "";
@@ -92,8 +96,7 @@ function syncMetaInputs() {
   if (!state.annotation) return;
   const statusSelect = document.getElementById("status-select");
   if (statusSelect) statusSelect.value = state.annotation.status || "draft";
-  const tagsInput = document.getElementById("tags-input");
-  if (tagsInput) tagsInput.value = (state.annotation.tags || []).join(", ");
+  actions.renderCaseTags();
 }
 
 function renderFormArea() {
