@@ -10,7 +10,7 @@ Transcribe ONE page image into HTML that keeps its printed layout. You are a tra
 
 ## 2. Allowed containers
 
-Use exactly these four elements, nothing else:
+Use exactly these four containers, plus the three table sections `<thead> <tbody> <tfoot>`, nothing else:
 
 | Element | Use it when |
 |---|---|
@@ -21,7 +21,7 @@ Use exactly these four elements, nothing else:
 
 Rules for each:
 
-- `<table>`: `<tr>` per printed row, `<th>` only for a printed heading cell, `<td>` for every other cell. Never invent a heading that is not printed; if a heading cell is blank use `<td></td>`.
+- `<table>`: always `<thead>` for the printed heading row, `<tbody>` for all data rows, and `<tfoot>` for a printed total row that belongs to that table (`Total Fee($)`, `總收費`). `<tr>` per printed row, `<th>` only for a printed heading cell, `<td>` for every other cell. Never invent a heading that is not printed; if a heading cell is blank use `<td></td>`.
 - `<dl>`: `<dt>` is the printed label exactly as printed, `<dd>` is the content written in that label's own filling area. One `<dl>` per printed block of fields, labels top to bottom.
 - `<pre>`: paragraph text only, line breaks as printed, no markdown.
 - `<div>`: one region per `<div>`, content in reading order.
@@ -34,12 +34,13 @@ Rules for each:
 4. **Notes and footnotes belong to the row above.** A printed explanation line attached to a row is a `<tr><td colspan="N">…</td></tr>` inside that table.
 5. **Nesting only for a real printed table.** A page-level total printed inside a service table may nest; everything else stays flat.
 6. **Rows of one item share one label.** When a printed label owns several following rows that carry no charge of their own (continuation lines of the same service), write the label cell once with `rowspan="N"` covering those rows, and write each continuation line in its own row. The charge stays in the single row where it is printed; the continuation rows leave that cell empty. Never repeat the label on each line, and never output a continuation line as a row with its own label.
+7. **Every table is sectioned.** `<thead>` holds the printed heading row and nothing else; `<tbody>` holds every data row, including rows whose first cell is a group label such as `MEDICATION DETAILS`. Use `<tfoot>` only for a printed total row that sits inside the table; a total printed outside the table stays a `<div>`.
 
 ## 3. Cell content rules
 
 - **Copy character by character.** This overrides everything else: never shorten, reword, translate, modernise, re-punctuate or "clean up" any text. A Chinese clause printed as `退還之保費` must be written `退還之保費`, not `退保金`. A bullet printed as `-` must not become `•`.
 - **Numbers are copied digit by digit.** Never drop, add, round or regroup a digit. `0003356007` must stay `0003356007`, never `000335600`. If a digit is illegible write `?` instead of leaving it out.
-- Only these tags may appear: `<table> <tr> <th> <td> <dl> <dt> <dd> <pre> <div> <br>`. Never use `<p>`, `<b>`, `<span>`, `<ul>`, `<li>`, `<h1>`–`<h6>` or any attribute other than `colspan` / `rowspan`.
+- Only these tags may appear: `<table> <thead> <tbody> <tfoot> <tr> <th> <td> <dl> <dt> <dd> <pre> <div> <br>`. Never use `<p>`, `<b>`, `<span>`, `<ul>`, `<li>`, `<h1>`–`<h6>` or any attribute other than `colspan` / `rowspan`.
 - Empty filling area: `<td></td>` or `<dd></dd>`. A printed mark is a mark: keep its exact form — `-` stays `-`, `--` stays `--`, `/` stays `/`. Never shorten, lengthen or normalize a mark.
 - Unreadable handwriting: copy your best reading; if truly illegible write `?`. Never guess a digit.
 - A cell holding several printed lines stays ONE cell: separate the lines with `<br>`. Never split one cell into several rows or columns.
@@ -63,6 +64,7 @@ Do not reorder rows to group similar content. Do not move a paragraph to the top
 3. Is every printed mark (`-`, `--`, `/`) still in its original form, and is every written amount in the same row and column where it was written?
 4. **Self-check every table for collapsed columns.** A real table has a heading row and, below it, cells in more than one column. If any `<table>` you produced has every row written as a single `<td>` (label only, no value column), you have failed to read the value column: re-read that region on the image and rebuild the table with its cells before outputting.
 5. **Self-check that labels keep their values.** For every printed fee label (`SP-PRE FEE($)`, `SP-POST FEE($)`, `Total Fee($)`, `PROCEDURE(S)`, `PROCEDURE CODE`, `LABORATORY FEE($)`, `MEDICATION FEE($)`, and every `Bill on chit` row), confirm the amount printed next to it appears in the same row. If a label appears without its value while the image shows a value, re-read and fix it before outputting.
+6. **Self-check the sections.** Every `<table>` has `<thead>` and `<tbody>`. A row whose first cell is a group label (`MEDICATION DETAILS`, `OTHER SERVICE(S)`) is a data row inside `<tbody>`, never a heading. A total printed inside the table is in `<tfoot>`; a total printed outside stays a `<div>`.
 
 ## 6. Example shape
 
@@ -72,10 +74,14 @@ Do not reorder rows to group similar content. Do not move a paragraph to the top
   <dt>Consultation Date 診症日期</dt><dd>02 Oct 2024</dd>
 </dl>
 <table>
-  <tr><th>Medical Service 醫療服務</th><th>Bill on chit 賬單記賬 (HK$)</th><th>Payment by patient 病人支付 (HK$)</th></tr>
-  <tr><td>Extra Medication 額外藥物</td><td>-</td><td>-</td></tr>
-  <tr><td>Minor Operation Procedure 小手術</td><td>4,016.0</td><td>-</td></tr>
-  <tr><td>CO2Laser &gt;40 lesion excl wart</td><td></td><td></td></tr>
+  <thead>
+    <tr><th>Medical Service 醫療服務</th><th>Bill on chit 賬單記賬 (HK$)</th><th>Payment by patient 病人支付 (HK$)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Extra Medication 額外藥物</td><td>-</td><td>-</td></tr>
+    <tr><td>Minor Operation Procedure 小手術</td><td>4,016.0</td><td>-</td></tr>
+    <tr><td>CO2Laser &gt;40 lesion excl wart</td><td></td><td></td></tr>
+  </tbody>
 </table>
 <pre>
 本人明白是項申請核准並不代表所有醫療費用均能由保險承擔
