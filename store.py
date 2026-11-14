@@ -67,7 +67,12 @@ def make_annotation(project, case: dict, schema_info: dict) -> dict:
 
 
 def load_annotation(project, case_id: str) -> dict | None:
-    data = jsonio.read_json(annotation_path(project, case_id))
+    # 与 list_annotations 同一口径：单个写坏的文件视为「无标注」，
+    # 读取路径回退到默认值，保存 / 导入会重写修复它，而不是让请求 500。
+    try:
+        data = jsonio.read_json(annotation_path(project, case_id))
+    except (OSError, ValueError):
+        return None
     return data if isinstance(data, dict) else None
 
 

@@ -154,7 +154,8 @@ function scheduleViewerFit() {
   ui.fitFrame = requestAnimationFrame(() => {
     ui.fitFrame = null;
     const image = document.getElementById("viewer-img");
-    if (ui.viewer && image && image.naturalWidth) ui.viewer.fit();
+    // resize 而非 fit：开了「保持视图」时拖分栏不会丢掉当前缩放与位置。
+    if (ui.viewer && image && image.naturalWidth) ui.viewer.resize();
   });
 }
 

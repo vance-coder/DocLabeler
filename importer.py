@@ -739,7 +739,9 @@ def run_import(
 
         status = ann.get("status") or "draft"
         group_status = str(group.get("status") or "").strip()
-        if group_status:
+        # baseline 模式只刷新快照：status 与值 / 备注一样属于人工结论，
+        # 不能被预测宽表里的 status 列覆盖（否则 done 会被打回 draft）。
+        if group_status and mode != "baseline":
             if group_status in store.STATUSES:
                 status = group_status
             else:

@@ -128,6 +128,7 @@ function renderShell() {
             <span class="scale" id="scale-label">100%</span>
             <button class="btn" id="btn-zoom-in" title="Zoom in" aria-label="Zoom in"><i class="bi bi-plus-lg"></i></button>
             <button class="btn" id="btn-rotate" title="Rotate 90°" aria-label="Rotate 90 degrees"><i class="bi bi-arrow-clockwise"></i></button>
+            <button class="btn" id="btn-keep-view" title="Keep zoom & position when switching cases" aria-label="Keep zoom and position when switching cases" aria-pressed="false"><i class="bi bi-pin-angle"></i></button>
             <button class="btn" id="btn-reset" title="Reset view" aria-label="Reset view"><i class="bi bi-arrow-counterclockwise"></i></button>
           </div>
           <button type="button" class="btn small pane-expand-btn" id="btn-expand-right" title="Expand annotation panel" aria-label="Expand annotation panel" hidden>
@@ -241,6 +242,8 @@ function renderShell() {
   searchInput.addEventListener("input", () => {
     state.search = searchInput.value.trim();
     syncSearchControls();
+    // 索引按需加载：先按 ID / 路径过滤，字段值命中会在索引回来后自动补齐。
+    if (state.search) actions.ensureSearchIndex();
     runSearch();
   });
   searchClear.addEventListener("click", () => {
@@ -324,6 +327,20 @@ function renderShell() {
   const image = document.getElementById("viewer-img");
   const scaleLabel = document.getElementById("scale-label");
   ui.viewer = createViewer({ stage, img: image, scaleLabel });
+  ui.viewer.setKeepView(state.keepView);
+  const keepViewButton = document.getElementById("btn-keep-view");
+  const syncKeepViewButton = () => {
+    keepViewButton.classList.toggle("active", state.keepView);
+    keepViewButton.setAttribute("aria-pressed", String(state.keepView));
+  };
+  syncKeepViewButton();
+  keepViewButton.addEventListener("click", () => {
+    state.keepView = !state.keepView;
+    writeFlag(KEYS.keepView, state.keepView);
+    ui.viewer.setKeepView(state.keepView);
+    syncKeepViewButton();
+    toast(state.keepView ? "Zoom & position will be kept across cases" : "View resets to fit on each case");
+  });
   actions.bindEvidenceViewer();
   image.addEventListener("load", () => actions.setStageState("image"));
   image.addEventListener("error", () => actions.setStageState("error"));

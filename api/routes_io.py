@@ -18,7 +18,10 @@ router = APIRouter()
 @router.get("/api/projects/{project_id}/imports")
 def api_list_imports(project_id: str, request: Request) -> dict:
     proj = deps.project(request, project_id)
-    data = jsonio.read_json(proj.root / "imports" / "index.json", {"imports": []})
+    try:
+        data = jsonio.read_json(proj.root / "imports" / "index.json", {"imports": []})
+    except (OSError, ValueError):
+        data = None
     return data if isinstance(data, dict) else {"imports": []}
 
 
@@ -27,7 +30,10 @@ def api_import_report(project_id: str, import_id: str, request: Request) -> dict
     proj = deps.project(request, project_id)
     if not is_safe_id(import_id):
         raise HTTPException(status_code=400, detail="Invalid import ID")
-    report = jsonio.read_json(proj.root / "imports" / "reports" / f"{import_id}.json")
+    try:
+        report = jsonio.read_json(proj.root / "imports" / "reports" / f"{import_id}.json")
+    except (OSError, ValueError):
+        report = None
     if not isinstance(report, dict):
         raise HTTPException(status_code=404, detail="Import report not found")
     return report

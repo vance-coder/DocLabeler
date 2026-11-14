@@ -158,7 +158,9 @@ def _date(raw: Any, fmt: str) -> datetime | None:
 
 
 def _luhn(text: str) -> bool:
-    digits = [ch for ch in text if ch.isdigit()]
+    # isdigit() 会收录 '²' 这类上标字符但 int() 无法转换，
+    # 用 isdecimal() 保证筛出的字符一定能转成数字，脏数据不会炸掉规则求值。
+    digits = [ch for ch in text if ch.isdecimal()]
     if len(digits) < 8:
         return False
     total = 0
@@ -178,7 +180,9 @@ _IDCARD_CHECK = "10X98765432"
 
 def _idcard(text: str) -> bool:
     value = text.strip().upper()
-    if len(value) != 18 or not value[:17].isdigit():
+    # 限定 ASCII 数字：全角 / 上标等 Unicode 数字不是合法身份证字符，
+    # 也避免 int() 遇到 isdigit 为真但不可转换的字符时崩溃。
+    if len(value) != 18 or not value[:17].isascii() or not value[:17].isdigit():
         return False
     total = sum(int(ch) * weight for ch, weight in zip(value[:17], _IDCARD_WEIGHTS))
     return _IDCARD_CHECK[total % 11] == value[17]

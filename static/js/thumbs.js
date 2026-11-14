@@ -43,14 +43,27 @@ function ensureThumbVisible() {
   strip.scrollTo({ left: strip.scrollLeft + delta, behavior: "smooth" });
 }
 
-// 缩略图条同样限流：几万张图时不为每张都建 DOM 和观察器。
-const MAX_THUMBS = 1000;
+// 缩略图条同样限流，但以当前 case 为中心开一个窗口：
+// 几万张图时不为每张都建 DOM 和观察器，当前项也始终能被高亮和滚动定位。
+const THUMB_WINDOW = 160;
+
+function thumbWindow(all) {
+  if (all.length <= THUMB_WINDOW) return { start: 0, items: all };
+  const index = all.findIndex((item) => item.case_id === state.currentId);
+  const center = index >= 0 ? index : 0;
+  const start = Math.max(
+    0,
+    Math.min(all.length - THUMB_WINDOW, center - Math.floor(THUMB_WINDOW / 2))
+  );
+  return { start, items: all.slice(start, start + THUMB_WINDOW) };
+}
 
 function renderThumbs() {
   const strip = document.getElementById("thumb-strip");
   if (!strip) return;
   const all = actions.filteredCases();
-  const visible = all.length > MAX_THUMBS ? all.slice(0, MAX_THUMBS) : all;
+  const win = thumbWindow(all);
+  const visible = win.items;
   const show = visible.length > 1 && Boolean(state.projectId);
 
   if (!show) {
@@ -65,7 +78,8 @@ function renderThumbs() {
     return;
   }
 
-  const signature = visible
+  // 起点进 signature：当前 case 移出窗口时会整体重绘，窗口内移动只改高亮。
+  const signature = `${win.start}|` + visible
     .map((item) => {
       const annotation = item.annotation;
       const status = annotation ? annotation.status || "draft" : "unlabeled";
@@ -75,7 +89,8 @@ function renderThumbs() {
     .join("|");
 
   const activeChanged = ui.lastThumbActive !== state.currentId;
-  if (signature === ui.thumbSignature) {
+  // renderShell 会重建空容器，此时即使 signature 相同也必须重新填充。
+  if (signature === ui.thumbSignature && strip.querySelector(".thumb")) {
     strip.querySelectorAll(".thumb").forEach((thumb) => {
       const active = thumb.dataset.thumb === state.currentId;
       thumb.classList.toggle("active", active);

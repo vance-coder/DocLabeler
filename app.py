@@ -30,6 +30,16 @@ def create_app(workspace: Path) -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     include_routers(app)
 
+    # 静态资源默认没有 Cache-Control，浏览器会启发式缓存旧 JS/CSS，
+    # 导致前端更新后普通刷新看不到变化。no-cache 让浏览器每次带 ETag
+    # 回源校验：文件没变时仍是 304，变了就立刻拿到新版本。
+    @app.middleware("http")
+    async def no_cache_static(request, call_next):
+        response = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     @app.get("/")
     def index_page():
         return FileResponse(STATIC_DIR / "index.html")

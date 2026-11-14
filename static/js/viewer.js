@@ -10,6 +10,10 @@ export function createViewer({ stage, img, scaleLabel }) {
   const state = { scale: 1, fitScale: 1, rotate: 0, tx: 0, ty: 0 };
   let drag = null;
   let frame = 0;
+  // 保持视图：切 case 时沿用上一张的缩放倍率与画面中心，
+  // 不用每张图重新手动放大。pendingView 在 load() 时捕获、新图加载后应用。
+  let keepView = false;
+  let pendingView = null;
   let handlers = { onBox: null, onPick: null };
   let evidenceMap = {};
   let activePath = null;
@@ -65,16 +69,48 @@ export function createViewer({ stage, img, scaleLabel }) {
     paint();
   }
 
-  function fit() {
-    if (!img.naturalWidth) return;
+  function computeFitScale() {
     const width = Math.max(stage.clientWidth - 48, 60);
     const height = Math.max(stage.clientHeight - 48, 60);
     const scale = Math.min(width / img.naturalWidth, height / img.naturalHeight);
-    state.fitScale = scale > 0 ? scale : 1;
+    return scale > 0 ? scale : 1;
+  }
+
+  function fit() {
+    if (!img.naturalWidth) return;
+    pendingView = null;
+    state.fitScale = computeFitScale();
     state.scale = state.fitScale;
     state.rotate = 0;
     state.tx = 0;
     state.ty = 0;
+    activePath = null;
+    renderBoxes();
+    flush();
+  }
+
+  /** 捕获当前视图：相对 fit 的缩放倍率 + 舞台中心对应的原图归一化坐标。
+   *  用归一化中心而不是像素 tx/ty，尺寸不同的图也能对准同一相对区域。 */
+  function captureView() {
+    const scale = state.scale || 1;
+    const angle = (-state.rotate * Math.PI) / 180;
+    const dx = -state.tx / scale;
+    const dy = -state.ty / scale;
+    const rx = dx * Math.cos(angle) - dy * Math.sin(angle);
+    const ry = dx * Math.sin(angle) + dy * Math.cos(angle);
+    return {
+      zoom: state.fitScale ? state.scale / state.fitScale : 1,
+      u: (rx + img.naturalWidth / 2) / img.naturalWidth,
+      v: (ry + img.naturalHeight / 2) / img.naturalHeight,
+    };
+  }
+
+  function restoreView(view, preserveRotate = false) {
+    state.fitScale = computeFitScale();
+    state.scale = clampScale(view.zoom * state.fitScale);
+    if (!preserveRotate) state.rotate = 0;
+    state.tx = (0.5 - view.u) * state.scale * img.naturalWidth;
+    state.ty = (0.5 - view.v) * state.scale * img.naturalHeight;
     activePath = null;
     renderBoxes();
     flush();
@@ -213,7 +249,10 @@ export function createViewer({ stage, img, scaleLabel }) {
   }
 
   img.addEventListener("load", () => {
-    fit();
+    const view = pendingView;
+    pendingView = null;
+    if (keepView && view) restoreView(view);
+    else fit();
     renderBoxes();
   });
   img.addEventListener("dragstart", (event) => event.preventDefault());
@@ -315,10 +354,13 @@ export function createViewer({ stage, img, scaleLabel }) {
 
   return {
     load(url) {
+      // 切图前先记下当前视图；同一张图重复 load 时捕获的就是现值，无副作用。
+      if (keepView && img.naturalWidth) pendingView = captureView();
       img.src = url;
     },
     clear() {
       img.removeAttribute("src");
+      pendingView = null;
       state.scale = 1;
       state.fitScale = 1;
       state.rotate = 0;
@@ -332,6 +374,17 @@ export function createViewer({ stage, img, scaleLabel }) {
     },
     fit,
     reset: fit,
+    /** 舞台尺寸变化（拖分栏 / 折叠面板）时的自动适配：
+     *  开了保持视图就维持当前倍率与中心，否则照旧 fit。 */
+    resize() {
+      if (!img.naturalWidth) return;
+      if (keepView) restoreView(captureView(), true);
+      else fit();
+    },
+    setKeepView(enabled) {
+      keepView = Boolean(enabled);
+      if (!keepView) pendingView = null;
+    },
     zoomIn: () => {
       state.scale = clampScale(state.scale * 1.2);
       apply();

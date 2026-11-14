@@ -21,6 +21,7 @@ export const KEYS = {
   rightCollapsed: "doclabeler.rightCollapsed",
   rawCollapsed: "doclabeler.rawCollapsed",
   onlyChanged: "doclabeler.onlyChanged",
+  keepView: "doclabeler.keepView",
 };
 
 export const PANE = {
@@ -117,6 +118,7 @@ export const state = {
   search: "",
   autoAdvance: readAutoAdvance(),
   onlyChanged: readFlag(KEYS.onlyChanged, false),
+  keepView: readFlag(KEYS.keepView, false),
   bulkBusy: false,
   revertingAll: false,
   conflict: false,
@@ -143,6 +145,13 @@ export const ui = {
   evidenceEditor: null,
   refreshToken: 0,
   searchHitCache: { query: "", map: new Map() },
+  // 折叠的目录分组：整表重绘后仍保持折叠，不用每次重新折。
+  collapsedFolders: new Set(),
+  // 左侧列表分批渲染：首屏只建 INITIAL_ROWS 行，往下滚或点按钮再追加。
+  // resetKey 变化时（搜索 / 过滤 / 标签 / 项目）回到首屏数量。
+  listLimit: 0,
+  listTotal: 0,
+  listResetKey: "",
 };
 
 export const history = {

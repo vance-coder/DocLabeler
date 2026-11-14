@@ -184,9 +184,20 @@ def _build_export(
                 }
             )
 
-        ann = store.load_annotation(project, case_id) or store.make_annotation(
-            project, case, schema_info
-        )
+        ann = store.load_annotation(project, case_id)
+        if ann is None:
+            # 文件存在却读不出来（写坏 / 无权限）：仍导出默认空值，
+            # 但记一条 warning，不静默吞掉也不让整个导出失败。
+            if store.annotation_path(project, case_id).exists():
+                warnings.append(
+                    {
+                        "case_id": case_id,
+                        "kind": "annotation",
+                        "field_path": "",
+                        "message": "Annotation file is unreadable; exported empty default values",
+                    }
+                )
+            ann = store.make_annotation(project, case, schema_info)
         values = ann.get("values") if isinstance(ann.get("values"), dict) else {}
         notes = ann.get("notes") or {}
         evidence = store.normalize_evidence(ann.get("evidence"))
@@ -366,7 +377,13 @@ def list_exports(project) -> list[dict]:
         # 崩溃残留的 staging 目录不是一次有效导出，不展示给用户。
         if not directory.is_dir() or directory.name.startswith(STAGING_PREFIX):
             continue
-        meta = jsonio.read_json(directory / "manifest.json", {}) or {}
+        # 单个写坏的 manifest.json 不能让整个导出列表 500。
+        try:
+            meta = jsonio.read_json(directory / "manifest.json", {}) or {}
+        except (OSError, ValueError):
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
         out.append(
             {
                 "version": directory.name,

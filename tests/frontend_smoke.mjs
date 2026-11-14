@@ -75,7 +75,7 @@ globalThis.confirm = () => false;
 globalThis.window = globalThis;
 globalThis.fetch = () => Promise.reject(new Error("network disabled in headless check"));
 
-const { actions, state } = await import(url("state.js"));
+const { actions, state, ui } = await import(url("state.js"));
 // main.js 末尾会自动 route()，这里换成 no-op，避免自检触发网络与整页渲染。
 actions.route = () => {};
 await import(url("main.js"));
@@ -123,5 +123,34 @@ if (!inserted.includes('class="badge rule"') || !inserted.includes(">2<")) {
 state.filter = "invalid";
 actions.updateCaseValidationBadge("c1", 0);
 if (rendered !== 1) throw new Error("invalid filter should trigger a full list render");
+
+// 4) 列表分批渲染：首屏 60 行、点按钮追加一批、过滤变化回到首屏、
+//    跳到远处的 case 时自动把渲染上限扩到能包含它。
+state.search = "";
+state.tagFilter = "";
+state.filter = "all";
+state.cases = Array.from({ length: 250 }, (_, i) => ({
+  case_id: `c${i}`, source: `c${i}.png`, annotation: null,
+}));
+const listEl = document.getElementById("case-list");
+listEl.querySelector = () => null;
+const rowCount = () => (listEl.innerHTML.match(/class="case-item/g) || []).length;
+
+actions.renderImagesCaseList();
+if (rowCount() !== 60) throw new Error(`first paint should be 60 rows, got ${rowCount()}`);
+if (!listEl.innerHTML.includes("data-more-rows")) {
+  throw new Error("remaining cases must expose a show-more control");
+}
+actions.showMoreCases({ force: true });
+if (rowCount() !== 160) throw new Error(`show more should be 160 rows, got ${rowCount()}`);
+
+state.currentId = "c200";
+if (!actions.revealActiveCase()) throw new Error("active case outside the window must be revealed");
+if (ui.listLimit < 201) throw new Error(`render limit did not cover active case: ${ui.listLimit}`);
+state.currentId = null;
+
+state.filter = "pending";
+actions.renderImagesCaseList();
+if (rowCount() !== 60) throw new Error(`filter change should reset to 60 rows, got ${rowCount()}`);
 
 console.log(`frontend smoke OK; ${Object.keys(actions).length} actions registered`);

@@ -19,6 +19,19 @@ document.addEventListener("keydown", (event) => {
   if (menu && !menu.hidden) menu.hidden = true;
 });
 
+// 目录折叠状态在整表重绘后保留：summary 点击时记录点击后的状态，
+// groupedCasesHtml 据此决定 open，点 case / 保存 / 勾选不会全部重新展开。
+document.addEventListener("click", (event) => {
+  const summary = event.target.closest(".folder-group > summary");
+  if (!summary) return;
+  const group = summary.parentElement;
+  const folder = group.dataset.folder;
+  if (!folder) return;
+  // 默认动作在 click 事件之后才翻转 open，这里 group.open 还是点击前的状态。
+  if (group.open) ui.collapsedFolders.add(folder);
+  else ui.collapsedFolders.delete(folder);
+});
+
 // ---------------------------------------------------------------------------
 // 列表
 // ---------------------------------------------------------------------------
@@ -68,8 +81,17 @@ async function loadSearchIndex(projectId) {
     ui.searchHitCache = { query: "", map: new Map() };
     if (state.search) renderCaseList();
   } catch (error) {
-    /* 全局搜索不可用时，仍可搜索 case ID 与路径 */
+    /* 索引不可用时仍可搜索 case ID 与路径；保持 null，下次输入可重试。 */
   }
+}
+
+// 打开项目时不再预拉全量索引：首次真正搜索才拉，且并发只发一次请求。
+function ensureSearchIndex() {
+  if (state.searchIndex || !state.projectId || searchIndexInFlight) return;
+  const projectId = state.projectId;
+  searchIndexInFlight = loadSearchIndex(projectId).finally(() => {
+    searchIndexInFlight = null;
+  });
 }
 
 function reloadSearchIndex() {
@@ -209,7 +231,8 @@ function groupedCasesHtml(visible) {
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([folder, items]) => {
       const rows = items.map(caseRowHtml).join("");
-      return `<details class="folder-group" open>
+      const open = ui.collapsedFolders.has(folder) ? "" : " open";
+      return `<details class="folder-group" data-folder="${escapeHtml(folder)}"${open}>
         <summary>${escapeHtml(folder)} <span class="muted">${items.length}</span></summary>
         <div class="list-group list-group-flush">${rows}</div>
       </details>`;
@@ -231,12 +254,14 @@ function renderTagChips(items) {
     state.tagFilter = "";
   }
   row.hidden = false;
-  row.innerHTML = counts
-    .map(
-      ([tag, count]) =>
-        `<button type="button" class="chip tag-chip${state.tagFilter === tag ? " active" : ""}" data-tag="${escapeHtml(tag)}" aria-pressed="${state.tagFilter === tag}"><i class="bi bi-tag" aria-hidden="true"></i>${escapeHtml(tag)} <span class="chip-count">${count}</span></button>`
-    )
-    .join("");
+  row.innerHTML =
+    counts
+      .map(
+        ([tag, count]) =>
+          `<button type="button" class="chip tag-chip${state.tagFilter === tag ? " active" : ""}" data-tag="${escapeHtml(tag)}" aria-pressed="${state.tagFilter === tag}"><i class="bi bi-tag" aria-hidden="true"></i>${escapeHtml(tag)} <span class="chip-count">${count}</span></button>`
+      )
+      .join("") +
+    `<button type="button" class="tag-manage-btn" id="btn-manage-tags" title="Rename or delete tags project-wide" aria-label="Manage tags"><i class="bi bi-gear" aria-hidden="true"></i></button>`;
   row.querySelectorAll("[data-tag]").forEach((chip) => {
     chip.addEventListener("click", () => {
       const tag = chip.dataset.tag;
@@ -244,19 +269,72 @@ function renderTagChips(items) {
       renderCaseList();
     });
   });
+  const manage = row.querySelector("#btn-manage-tags");
+  if (manage) manage.addEventListener("click", () => actions.openTagManager());
 }
 
-// 大目录（几万张图）时只渲染前 N 行：浏览器不会被几万个 DOM 节点卡死，
-// 仍然可以用搜索 / 过滤定位，上一张、下一张也能遍历全部 case。
-const MAX_ROWS = 1000;
+// 首屏只建少量行，滚动到底 / 点按钮再追加。数据仍是全量 state.cases，
+// 所以搜索、过滤计数、跨行多选、Space 跳下一个待复核都不受影响。
+const INITIAL_ROWS = 60;
+const ROW_BATCH = 100;
+const LOAD_AHEAD_PX = 240;
+let searchIndexInFlight = null;
+let moreCooldownUntil = 0;
+let moreScheduled = false;
 
-function renderImagesCaseList() {
+function listResetKey() {
+  return `${state.projectId}|${state.search}|${state.filter}|${state.tagFilter}`;
+}
+
+function resetListLimitIfNeeded() {
+  const key = listResetKey();
+  if (ui.listResetKey === key) return;
+  ui.listResetKey = key;
+  ui.listLimit = INITIAL_ROWS;
+}
+
+// 追加下一批：只重绘列表本身，不碰缩略图 observer / 批量栏，
+// 并保留滚动位置与目录折叠状态。
+function showMoreCases(options = {}) {
+  const total = Number(ui.listTotal) || 0;
+  if (ui.listLimit >= total) return false;
+  const now = Date.now();
+  // 重绘可能触发新的 scroll 事件，短暂冷却避免一次滚动连锁加载到底。
+  if (!options.force && now < moreCooldownUntil) return false;
+  moreCooldownUntil = now + 250;
+  ui.listLimit = Math.min(total, ui.listLimit + ROW_BATCH);
   const list = document.getElementById("case-list");
-  if (!list) return;
-  const searched = searchIn(state.cases);
-  renderTagChips(searched);
-  const base = searched.filter(matchesTag);
-  renderFilterChips(document.getElementById("filter-row"), base);
+  const scrollTop = list ? list.scrollTop : 0;
+  renderImagesCaseList();
+  if (list) list.scrollTop = scrollTop;
+  return true;
+}
+
+// scroll 不冒泡，用捕获阶段挂在 document 上；列表元素会被 renderShell 重建，
+// 这样就不必每次重新绑定。
+document.addEventListener(
+  "scroll",
+  (event) => {
+    const list = event.target;
+    if (!list || list.id !== "case-list" || moreScheduled) return;
+    if (list.scrollTop + list.clientHeight < list.scrollHeight - LOAD_AHEAD_PX) return;
+    moreScheduled = true;
+    requestAnimationFrame(() => {
+      moreScheduled = false;
+      showMoreCases();
+    });
+  },
+  true
+);
+
+// "Show more" 按钮走事件委托，避免重绘后重新绑定。
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("[data-more-rows]")) return;
+  showMoreCases({ force: true });
+});
+
+// 过滤 + 排序后的顺序，列表渲染和「跳到当前 case」共用同一份口径。
+function orderedCases(base) {
   let visible = filterIn(base);
   if (state.filter === "low") {
     visible = [...visible].sort((a, b) => {
@@ -273,6 +351,32 @@ function renderImagesCaseList() {
   } else if (state.filter === "pending") {
     visible = [...visible].sort((a, b) => reviewPriority(b) - reviewPriority(a));
   }
+  return visible;
+}
+
+// 键盘 / 复核队列跳到尚未渲染的 case 时，把上限扩到能包含它，
+// 否则整表重绘后当前行依旧不在 DOM，高亮与滚动跟随都会失效。
+function revealActiveCase() {
+  if (!state.currentId) return false;
+  const visible = orderedCases(searchIn(state.cases).filter(matchesTag));
+  const index = visible.findIndex((item) => item.case_id === state.currentId);
+  if (index < 0 || index < ui.listLimit) return false;
+  ui.listLimit = Math.min(
+    visible.length,
+    Math.ceil((index + 1) / ROW_BATCH) * ROW_BATCH
+  );
+  return true;
+}
+
+function renderImagesCaseList() {
+  const list = document.getElementById("case-list");
+  if (!list) return;
+  resetListLimitIfNeeded();
+  const searched = searchIn(state.cases);
+  renderTagChips(searched);
+  const base = searched.filter(matchesTag);
+  renderFilterChips(document.getElementById("filter-row"), base);
+  const visible = orderedCases(base);
   const count = document.getElementById("case-count");
   if (count) count.textContent = `${visible.length}/${state.cases.length}`;
 
@@ -293,10 +397,20 @@ function renderImagesCaseList() {
       `No cases tagged “${state.tagFilter}”.`
     );
   }
-  const shown = visible.length > MAX_ROWS ? visible.slice(0, MAX_ROWS) : visible;
+  ui.listTotal = visible.length;
+  if (ui.listLimit > visible.length) ui.listLimit = visible.length;
+  // 曾被空过滤 clamp 到 0、随后同一过滤下又出现数据时，回到首屏数量。
+  if (visible.length && ui.listLimit < INITIAL_ROWS) {
+    ui.listLimit = Math.min(visible.length, INITIAL_ROWS);
+  }
+  const shown = visible.slice(0, ui.listLimit);
   let html = groupedCasesHtml(shown) || emptyState;
-  if (visible.length > MAX_ROWS) {
-    html += `<div class="list-more-note">Showing first ${MAX_ROWS} of ${visible.length} cases — use search or filters to narrow down.</div>`;
+  const remaining = visible.length - shown.length;
+  if (remaining > 0) {
+    html += `<div class="list-more-note">
+      <button type="button" class="btn small" data-more-rows="1">Show ${Math.min(ROW_BATCH, remaining)} more</button>
+      <span>${shown.length} / ${visible.length} shown · scroll down to load more, or use search / filters</span>
+    </div>`;
   }
   list.innerHTML = html;
 }
@@ -305,6 +419,32 @@ function renderCaseList() {
   renderImagesCaseList();
   actions.updateBulkBar();
   actions.renderThumbs();
+}
+
+// 切 case 时只局部更新高亮并滚动跟随，避免整表重建上千行 DOM：
+// 更跟手，也不扰动滚动位置与目录折叠状态。
+// 当前行不在 DOM 里（被过滤 / 截断）时返回 false，调用方回退整表重绘。
+function highlightActiveCase() {
+  const list = document.getElementById("case-list");
+  if (!list || !state.currentId) return false;
+  let row = null;
+  try {
+    row = list.querySelector(`.case-item[data-case="${CSS.escape(state.currentId)}"]`);
+  } catch (error) {
+    row = null;
+  }
+  if (!row) return false;
+  // 活跃 case 落在折叠分组里时自动展开，否则滚动到不了它。
+  const group = row.closest("details.folder-group");
+  if (group && !group.open) {
+    group.open = true;
+    ui.collapsedFolders.delete(group.dataset.folder);
+  }
+  list.querySelectorAll(".case-item.active").forEach((el) => el.classList.remove("active"));
+  row.classList.add("active");
+  // nearest：行已在视野内时不打扰手动滚动。
+  row.scrollIntoView({ block: "nearest" });
+  return true;
 }
 
 // 单独抽出徽标 HTML：校验结果返回后只需替换这一行的徽标，
@@ -409,7 +549,6 @@ function caseRowHtml(item) {
   const normalized = source.replace(/\\/g, "/");
   const slash = normalized.lastIndexOf("/");
   const fileName = slash >= 0 ? normalized.slice(slash + 1) : normalized;
-  const dirPath = slash > 0 ? normalized.slice(0, slash) : "";
   const displayName = fileName || item.case_id;
   const fullTitle = `${item.case_id} · ${source}`;
   const dotClass =
@@ -442,7 +581,6 @@ function caseRowHtml(item) {
     <span class="${dotClass}" title="${dotTitle}"></span>
     <span class="case-name" title="${escapeHtml(fullTitle)}">
       <span class="case-file">${escapeHtml(displayName)}</span>
-      ${dirPath ? `<span class="case-dir">${escapeHtml(dirPath)}</span>` : ""}
       ${hitHtml}
     </span>
     ${badges.join("")}
@@ -459,13 +597,34 @@ function onCaseListClick(event) {
   const checkbox = event.target.closest("[data-check]");
   if (checkbox) {
     const id = checkbox.dataset.check;
-    if (state.selected.has(id)) state.selected.delete(id);
-    else state.selected.add(id);
-    renderCaseList();
+    setCaseSelected(id, checkbox.closest("[data-case]"), !state.selected.has(id));
     return;
   }
   const item = event.target.closest("[data-case]");
-  if (item) actions.selectCase(item.dataset.case);
+  if (!item) return;
+  const id = item.dataset.case;
+  if (event.detail >= 2) {
+    // 双击：取消挂起的单击切 case，只切换勾选，批量勾选时视图不乱跳。
+    clearTimeout(pendingClickTimer);
+    if (event.detail === 2) setCaseSelected(id, item, !state.selected.has(id));
+    return;
+  }
+  // 单击等一个双击判定窗口（同资源管理器），键盘 / 缩略图导航不受影响。
+  clearTimeout(pendingClickTimer);
+  pendingClickTimer = setTimeout(() => actions.selectCase(id), DBLCLICK_WINDOW);
+}
+
+// 单击切 case、双击勾选的判定窗口；复选框 / 搜索命中按钮不走延迟。
+const DBLCLICK_WINDOW = 250;
+let pendingClickTimer = 0;
+
+// 勾选只局部更新复选框与批量栏，不整表重绘，不打断滚动与折叠。
+function setCaseSelected(id, row, selected) {
+  if (selected) state.selected.add(id);
+  else state.selected.delete(id);
+  const checkbox = row && row.querySelector("[data-check]");
+  if (checkbox) checkbox.checked = selected;
+  actions.updateBulkBar();
 }
 
 function gotoRelative(delta) {
@@ -553,7 +712,9 @@ Object.assign(actions, {
   matchesSearch,
   fieldHitsFor,
   loadSearchIndex,
+  ensureSearchIndex,
   reloadSearchIndex,
+  showMoreCases,
   caseMatchesFilter,
   searchIn,
   filterIn,
@@ -567,6 +728,8 @@ Object.assign(actions, {
   renderTagChips,
   renderImagesCaseList,
   renderCaseList,
+  revealActiveCase,
+  highlightActiveCase,
   caseRowHtml,
   caseBadgesHtml,
   refreshFilterCounts,

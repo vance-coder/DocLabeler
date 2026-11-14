@@ -176,7 +176,7 @@ async function openProject(projectId) {
 
     actions.renderShell();
     actions.renderCaseList();
-    actions.loadSearchIndex(projectId);
+    // 搜索索引按需加载（首次输入搜索时才拉），避免打开项目就取全量字段值。
     const target =
       state.currentId && state.cases.some((c) => c.case_id === state.currentId)
         ? state.currentId
@@ -234,7 +234,8 @@ async function refreshProject() {
     actions.renderShell();
     clearRefreshError();
     actions.renderCaseList();
-    actions.loadSearchIndex(projectId);
+    // 已经加载过索引才刷新；没搜过时不为刷新白白拉一份全量索引。
+    if (state.searchIndex) actions.loadSearchIndex(projectId);
     if (state.currentId && state.cases.some((c) => c.case_id === state.currentId)) {
       await actions.selectCase(state.currentId);
     } else if (actions.filteredCases()[0]) {

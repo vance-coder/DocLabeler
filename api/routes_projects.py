@@ -181,11 +181,15 @@ def api_cases(project_id: str, request: Request, refresh: int = 0) -> dict:
         if ann:
             diff = diffing.diff_for_case(proj, ann, info, baseline_cache)
             confidence = ann.get("confidence")
-            scores = (
-                [float(value) for value in confidence.values()]
-                if isinstance(confidence, dict)
-                else []
-            )
+            scores: list[float] = []
+            if isinstance(confidence, dict):
+                # 旧数据 / 手工文件里可能混入非数字分数，跳过即可，
+                # 与复核预览的口径一致，不能让整个 case 列表 500。
+                for raw in confidence.values():
+                    try:
+                        scores.append(float(raw))
+                    except (TypeError, ValueError):
+                        continue
             entry["annotation"] = {
                 "status": ann.get("status") or "draft",
                 "tags": ann.get("tags") or [],

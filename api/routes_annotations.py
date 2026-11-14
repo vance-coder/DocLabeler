@@ -147,6 +147,73 @@ def _bulk(proj, payload: dict) -> dict:
     return {"updated": len(updated), "skipped": skipped, "cases": updated}
 
 
+@router.post("/api/projects/{project_id}/tags/manage")
+def api_manage_tags(project_id: str, payload: dict, request: Request) -> dict:
+    proj = deps.project(request, project_id)
+    # 与 bulk 同一把锁：改名 / 删除期间不允许 schema 迁移或导入插入。
+    with locks.project_lock(proj):
+        return _manage_tags(proj, payload)
+
+
+def _manage_tags(proj, payload: dict) -> dict:
+    action = str(payload.get("action") or "")
+    if action not in ("rename", "delete"):
+        raise HTTPException(status_code=400, detail="Invalid tag action")
+    tag = str(payload.get("tag") or "").strip()
+    if not tag:
+        raise HTTPException(status_code=400, detail="tag is required")
+    new_tag = str(payload.get("new_tag") or "").strip()
+    if action == "rename":
+        if not new_tag:
+            raise HTTPException(status_code=400, detail="new_tag is required")
+        if new_tag.casefold() == tag.casefold():
+            raise HTTPException(status_code=400, detail="new_tag must differ from tag")
+
+    idx = deps.index(proj)
+    info = deps.schema_info(proj)
+    key = tag.casefold()
+    updated = 0
+    skipped: list[dict] = []
+    for case_id, item in scanner.index_map(idx).items():
+        ann = store.load_annotation(proj, case_id)
+        if not ann:
+            continue
+        current_tags = [str(t) for t in (ann.get("tags") or [])]
+        if action == "delete":
+            new_tags = [t for t in current_tags if t.casefold() != key]
+        else:
+            # 改名到已有标签时由保存端去重合并，保留先出现的写法。
+            new_tags = [new_tag if t.casefold() == key else t for t in current_tags]
+        # 不含该标签的 case 不写盘、不 bump rev，988 张里只动真正变化的。
+        if new_tags == current_tags:
+            continue
+        try:
+            store.save_annotation(
+                proj,
+                item,
+                {
+                    "values": ann.get("values") or {},
+                    "notes": ann.get("notes") or {},
+                    "evidence": ann.get("evidence") or {},
+                    "status": ann.get("status") or "draft",
+                    "tags": new_tags,
+                    "baseline_import_id": ann.get("baseline_import_id"),
+                },
+                info,
+                expected_rev=int(ann.get("rev") or 0),
+            )
+        except store.RevConflict:
+            skipped.append(
+                {"case_id": case_id, "reason": "Annotation was changed in another window"}
+            )
+            continue
+        except store.AnnotationError as exc:
+            skipped.append({"case_id": case_id, "reason": str(exc)})
+            continue
+        updated += 1
+    return {"updated": updated, "skipped": skipped}
+
+
 @router.get("/api/projects/{project_id}/diff/{case_id}")
 def api_diff(project_id: str, case_id: str, request: Request) -> dict:
     proj = deps.project(request, project_id)
@@ -206,32 +273,45 @@ def api_revert(project_id: str, case_id: str, payload: dict, request: Request) -
         else:
             restores.append((path, segs, old))
 
-    for path, segs, old in restores:
-        schema.set_value(values, segs, old)
-        reverted.append(path)
-    # 按数值下标倒序删除；字符串倒序会让 items[9] 排在 items[10] 前面。
-    def _deletion_key(entry):
-        return tuple(seg if isinstance(seg, int) else -1 for seg in entry[1])
-
-    for path, segs in sorted(deletions, key=_deletion_key, reverse=True):
-        diffing.delete_value(values, segs)
-        if revert_all:
+    # 与 PUT 标注保持同一套错误语义：并发修改返回 409 而不是 500，
+    # 路径结构不匹配 / 非法载荷返回 400。
+    try:
+        for path, segs, old in restores:
+            schema.set_value(values, segs, old)
             reverted.append(path)
-        else:
-            missing.append(path)
+        # 按数值下标倒序删除；字符串倒序会让 items[9] 排在 items[10] 前面。
+        def _deletion_key(entry):
+            return tuple(seg if isinstance(seg, int) else -1 for seg in entry[1])
 
-    saved = store.save_annotation(
-        proj,
-        item,
-        {
-            "values": values,
-            "notes": ann.get("notes") or {},
-            "evidence": ann.get("evidence") or {},
-            "status": ann.get("status") or "draft",
-            "tags": ann.get("tags") or [],
-            "baseline_import_id": ann.get("baseline_import_id"),
-        },
-        info,
-        expected_rev=payload.get("expected_rev"),
-    )
+        for path, segs in sorted(deletions, key=_deletion_key, reverse=True):
+            diffing.delete_value(values, segs)
+            if revert_all:
+                reverted.append(path)
+            else:
+                missing.append(path)
+
+        saved = store.save_annotation(
+            proj,
+            item,
+            {
+                "values": values,
+                "notes": ann.get("notes") or {},
+                "evidence": ann.get("evidence") or {},
+                "status": ann.get("status") or "draft",
+                "tags": ann.get("tags") or [],
+                "baseline_import_id": ann.get("baseline_import_id"),
+            },
+            info,
+            expected_rev=payload.get("expected_rev"),
+        )
+    except store.RevConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Annotation was changed in another window. Please refresh.",
+                "annotation": exc.current,
+            },
+        )
+    except (store.AnnotationError, schema.SchemaError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return {"annotation": saved, "reverted": reverted, "missing": missing}

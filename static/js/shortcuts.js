@@ -16,6 +16,8 @@ function openHelpModal() {
     ["<kbd>←</kbd> <kbd>→</kbd>", "Previous / next case"],
     ["<kbd>Alt</kbd> + <kbd>←</kbd> / <kbd>→</kbd>", "Previous / next case while typing"],
     ["<kbd>n</kbd>", "Next unlabeled case"],
+    ["<kbd>/</kbd>", "Focus search (Esc clears, then leaves)"],
+    ["Double-click row", "Select / deselect for bulk actions"],
     ["<kbd>Enter</kbd>", "Move to the next editable field"],
     ["<kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>S</kbd>", "Save"],
     ["<kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Enter</kbd>", "Save and next unlabeled"],
@@ -132,6 +134,19 @@ document.addEventListener("keydown", (event) => {
   }
   if (!state.projectId) return;
   if (typing) {
+    if (event.key === "Escape" && active.id === "case-search") {
+      // 第一下清关键词，第二下退出搜索框，把手还给全局快捷键。
+      if (state.search) {
+        state.search = "";
+        active.value = "";
+        const clear = document.getElementById("btn-search-clear");
+        if (clear) clear.hidden = true;
+        actions.renderCaseList();
+      } else {
+        active.blur();
+      }
+      return;
+    }
     if (
       event.key === "Enter" &&
       !event.shiftKey &&
@@ -188,6 +203,10 @@ document.addEventListener("keydown", (event) => {
     }
     event.preventDefault();
     actions.markDoneAndAdvance();
+  } else if (event.key === "/") {
+    event.preventDefault();
+    const input = document.getElementById("case-search");
+    if (input) input.focus();
   } else if (event.key === "ArrowLeft") {
     event.preventDefault();
     actions.gotoRelative(-1);

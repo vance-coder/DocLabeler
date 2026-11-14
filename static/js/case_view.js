@@ -32,7 +32,14 @@ async function selectCase(caseId) {
     applyAnnotation(annotationRes, diffRes);
     actions.hideConflictBanner();
     renderCase();
-    actions.renderCaseList();
+    // 切 case 只局部更新高亮并滚动跟随；当前行尚未渲染（分批截断）时先扩到包含它，
+    // 再整表重绘并重新定位，否则列表不会跟着 Space / 队列跳转走。
+    if (!actions.highlightActiveCase()) {
+      actions.revealActiveCase();
+      actions.renderCaseList();
+      actions.highlightActiveCase();
+    }
+    actions.renderThumbs();
   } catch (error) {
     state.currentId = previousId;
     actions.renderCaseList();

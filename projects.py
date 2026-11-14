@@ -122,7 +122,11 @@ def list_projects(workspace: Path) -> list[dict]:
     for directory in sorted(base.iterdir()):
         if not directory.is_dir():
             continue
-        meta = jsonio.read_json(directory / "project.json")
+        # 单个项目的元数据写坏不能挡住整个项目列表，跳过它即可。
+        try:
+            meta = jsonio.read_json(directory / "project.json")
+        except (OSError, ValueError):
+            continue
         if not isinstance(meta, dict):
             continue
         try:
@@ -131,7 +135,16 @@ def list_projects(workspace: Path) -> list[dict]:
             field_count = len(list(schema.iter_fields(info["schema"])))
         except Exception:
             schema_version, field_count = None, 0
-        index = jsonio.read_json(directory / "cases_index.json", {}) or {}
+        try:
+            index = jsonio.read_json(directory / "cases_index.json", {}) or {}
+        except (OSError, ValueError):
+            index = {}
+        if not isinstance(index, dict):
+            index = {}
+        try:
+            case_count = int(index.get("count") or 0)
+        except (TypeError, ValueError):
+            case_count = 0
         out.append(
             {
                 "project_id": meta.get("project_id", directory.name),
@@ -141,7 +154,7 @@ def list_projects(workspace: Path) -> list[dict]:
                 "created_at": meta.get("created_at", ""),
                 "schema_version": schema_version,
                 "field_count": field_count,
-                "case_count": int(index.get("count") or 0),
+                "case_count": case_count,
             }
         )
     return out
